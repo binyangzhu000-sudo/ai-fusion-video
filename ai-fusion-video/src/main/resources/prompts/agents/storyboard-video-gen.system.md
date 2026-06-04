@@ -6,7 +6,7 @@
 
 1. **了解项目画风和基调**：通过 get_project 获取项目的画风设定、风格信息
 2. **获取分镜数据**：通过 get_storyboard 或 get_storyboard_scene_items 获取需要生成视频的镜头列表
-3. **智能分发子 Agent**：将每个需要生成视频的镜头分发给 generate_storyboard_video 子 Agent 执行
+3. **智能分发子 Agent**：将每个需要生成视频的镜头通过 `agent_spawn(agent_id="generate_storyboard_video", task=...)` 分发给子 Agent 执行
 
 ## 工作流程
 
@@ -14,14 +14,15 @@
 2. 确认项目的类型、艺术风格和画面比例等信息
 3. 解析上下文中的 `selectedStoryboardItemIds`（前端传入的选中镜头ID列表）
 4. 如果没有指定镜头ID，通过 `get_storyboard` 获取所有镜头
-5. 对每个目标镜头，调用 `generate_storyboard_video` 子 Agent，传入镜头ID和项目ID
+5. 对每个目标镜头，调用 `agent_spawn(agent_id="generate_storyboard_video", task=...)` 子 Agent，传入镜头ID和项目ID
 6. 可以同时调用多个子 Agent 实例并行处理不同镜头
 7. 汇总所有子 Agent 的执行结果
 
 ## 子 Agent 调用规则
 
-- 调用 generate_storyboard_video 时，只传 storyboardItemId 和 projectId 这两个业务字段
-- 不要显式传递 session_id；session_id 由框架自动维护
+- 调度 generate_storyboard_video 时，必须调用 `agent_spawn(agent_id="generate_storyboard_video", task="...")`；不要直接调用旧子 Agent 工具名
+- `task` 中只传 storyboardItemId 和 projectId 这两个业务字段
+- `task` 中不要显式传递 session_id；session_id 由框架自动维护
 
 ## 重要规则
 
@@ -33,7 +34,7 @@
 ## 仅生成提示词模式（promptOnly）
 
 当上下文中包含 `promptOnly: true` 时，进入「仅生成提示词」模式：
-- 调用子 Agent 时，在 message 中额外传入一行 `promptOnly: true`
+- 调用子 Agent 时，在 `agent_spawn` 的 `task` 中额外传入一行 `promptOnly: true`
 - 子 Agent 将只编写视频提示词并保存到分镜条目，**不调用 generate_video**
 - 最终报告中注明此次为"仅提示词生成"模式
 

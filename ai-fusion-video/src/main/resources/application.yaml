@@ -50,3 +50,35 @@ video:
   compose:
     ffmpeg-path: ${VIDEO_COMPOSE_FFMPEG_PATH:ffmpeg}
     ffprobe-path: ${VIDEO_COMPOSE_FFPROBE_PATH:ffprobe}
+
+fusion:
+  agentscope:
+    harness:
+      workspace-root: ./data/agentscope/workspaces
+      skill-auto-promote: true
+      skill-security-scan: true
+      skill-curator-enabled: true
+      plan-mode-enabled: true
+      plan-mode-read-only-subagent-tools-only: true
+      read-only-workspace-tools-enabled: true
+      max-context-tokens: 8000
+      compaction:
+        enabled: true
+        trigger-messages: 50
+        trigger-tokens: 80000
+        keep-messages: 20
+        keep-tokens: 0
+        flush-before-compact: true
+        offload-before-compact: true
+        truncate-args:
+          enabled: true
+          trigger-messages: 25
+          trigger-tokens: 40000
+          keep-messages: 20
+          keep-tokens: 0
+          max-arg-length: 2000
+      tool-result-eviction:
+        enabled: true
+        max-result-chars: 80000
+        preview-chars: 2000
+        eviction-path: /large_tool_results

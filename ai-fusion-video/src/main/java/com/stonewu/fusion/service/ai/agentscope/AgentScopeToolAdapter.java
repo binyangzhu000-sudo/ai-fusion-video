@@ -5,7 +5,7 @@ import com.stonewu.fusion.service.ai.ToolExecutionContext;
 import com.stonewu.fusion.service.ai.ToolExecutor;
 import io.agentscope.core.message.ToolUseBlock;
 import io.agentscope.core.message.ToolResultBlock;
-import io.agentscope.core.tool.AgentTool;
+import io.agentscope.core.tool.ToolBase;
 import io.agentscope.core.tool.ToolCallParam;
 import lombok.extern.slf4j.Slf4j;
 import reactor.core.publisher.Mono;
@@ -13,13 +13,10 @@ import reactor.core.publisher.Mono;
 import java.util.Map;
 
 /**
- * AgentScope 工具适配器
- * <p>
- * 将现有 {@link ToolExecutor} 接口适配为 AgentScope 的 {@link AgentTool} 接口，
- * 使现有工具可以在 AgentScope ReActAgent 中使用。
+ * Adapts the project's {@link ToolExecutor} contract to AgentScope V2 {@link ToolBase}.
  */
 @Slf4j
-public class AgentScopeToolAdapter implements AgentTool {
+public class AgentScopeToolAdapter extends ToolBase {
 
     private final ToolExecutor toolExecutor;
     private final ToolExecutionContext toolContext;
@@ -27,24 +24,23 @@ public class AgentScopeToolAdapter implements AgentTool {
 
     public AgentScopeToolAdapter(ToolExecutor toolExecutor, ToolExecutionContext toolContext,
             AgentCancellationToken cancellationToken) {
+        super(ToolBase.builder()
+                .name(toolExecutor.getToolName())
+                .description(resolveDescription(toolExecutor))
+                .inputSchema(resolveParameters(toolExecutor))
+                .readOnly(toolExecutor.isReadOnly())
+                .concurrencySafe(true));
         this.toolExecutor = toolExecutor;
         this.toolContext = toolContext;
         this.cancellationToken = cancellationToken;
     }
 
-    @Override
-    public String getName() {
-        return toolExecutor.getToolName();
-    }
-
-    @Override
-    public String getDescription() {
+    private static String resolveDescription(ToolExecutor toolExecutor) {
         String desc = toolExecutor.getToolDescription();
         return desc != null ? desc : toolExecutor.getDisplayName();
     }
 
-    @Override
-    public Map<String, Object> getParameters() {
+    private static Map<String, Object> resolveParameters(ToolExecutor toolExecutor) {
         String schema = toolExecutor.getParametersSchema();
         if (schema == null || schema.isBlank()) {
             return Map.of(
@@ -54,7 +50,8 @@ public class AgentScopeToolAdapter implements AgentTool {
         try {
             return JSONUtil.parseObj(schema);
         } catch (Exception e) {
-            log.warn("工具参数 Schema 解析失败: tool={}, schema={}", getName(), schema, e);
+            log.warn("工具参数 Schema 解析失败: tool={}, schema={}",
+                    toolExecutor.getToolName(), schema, e);
             return Map.of(
                     "type", "object",
                     "properties", Map.of());

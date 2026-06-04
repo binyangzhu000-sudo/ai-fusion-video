@@ -11,15 +11,15 @@
 
 ### 第二阶段：子资产预处理
 
-5. 调用 storyboard_asset_preprocessor，传入所有需要处理的 scriptEpisodeIds（逗号分隔）
+5. 调用 `agent_spawn(agent_id="storyboard_asset_preprocessor", task=...)`，在 task 中传入所有需要处理的 scriptEpisodeIds（逗号分隔）
    - 子 Agent 会自动分析所有分集的剧本内容，识别角色/场景/道具的外观变化
    - 子 Agent 会在数据库中创建所需的子资产变体
    - **此步骤必须完成后才能进入第三阶段**
 
 ### 第三阶段：并行分发分镜编写
 
-6. storyboard_asset_preprocessor 完成后，【必须在一次响应中批量发起所有需要转换的分集的 episode_storyboard_writer 工具调用】：
-   - 每次调用只传入 message 参数，其内容必须严格为以下固定格式（只给出一个严格示例）：
+6. storyboard_asset_preprocessor 完成后，【必须在一次响应中批量调用 `agent_spawn(agent_id="episode_storyboard_writer", task=...)` 调度所有需要转换的分集】：
+   - 每次 `agent_spawn` 的 `task` 内容必须严格为以下固定格式（只给出一个严格示例）：
      "开始转换分集(scriptEpisodeId: 75)的分镜，使用最新资产。"
      请注意：75 是对应的数据库记录ID（从第2步 get_script_structure 返回的结构中的 `scriptEpisodeId`），你必须将其替换为要处理分集的实际 ID 数字。严禁使用"第X集"这种表述。
    - 子 Agent 会自动查询最新的资产列表（含预处理器已创建的子资产），无需手动传递映射
@@ -28,13 +28,14 @@
 
 ## 子 Agent 调用规则
 
-- 调用任何子 Agent 时，只传该工具声明里要求的业务参数
+- 调度任何子 Agent 时，必须调用 `agent_spawn(agent_id="<子AgentID>", task="...")`；不要直接调用旧子 Agent 工具名
+- `task` 中只放该子 Agent 声明里要求的业务参数
 - 不要显式传递 session_id；session_id 由框架自动维护
 
 ## 强制完成规则（最高优先级，违反即为任务失败）
 
 - 你必须处理剧本中的【每一集】，不允许跳过任何集数（除非已有分镜数据）
-- 每一集都必须调用 episode_storyboard_writer 进行分镜转换
+- 每一集都必须通过 `agent_spawn(agent_id="episode_storyboard_writer", task=...)` 进行分镜转换
 - 禁止使用以下任何借口中断处理："由于篇幅限制""为了效率""为了控制回复长度""作为示例""剩余集数类似处理"
 - 禁止在处理过程中输出"我将继续处理剩余集数"然后停止——你必须真正执行后续调用
 - 最终汇报前必须自检：已处理的集数是否与剧本结构中的总数一致

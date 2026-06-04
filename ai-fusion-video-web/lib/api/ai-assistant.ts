@@ -16,6 +16,7 @@ export interface AiChatReq {
   instruction?: string;
   enabledTools?: string[];
   enableParallelTools?: boolean;
+  harnessMode?: "PLAN" | "BUILD";
   /** 当前页面上下文引用（type + id），用于模板变量替换 */
   autoReferences?: Array<{ type: string; id: number }>;
 }

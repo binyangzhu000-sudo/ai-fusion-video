@@ -37,8 +37,8 @@
 7. 识别集数分界，仅对有原文内容的集，逐集调用 save_script_episode 写入集记录（必须传入 scriptId、episodeNumber、title、synopsis、rawContent 以及 sortOrder，其中 sortOrder 默认必须直接设为对应的物理集数 episodeNumber，例如第一集传 1，第二集传 2，以此类推）
    - 一次最多同时发起5个调用，如果超过5集则分批，每批最多5个同时调用
 
-8. 所有集记录创建完成后，【必须在一次响应中批量发起所有集的 episode_scene_writer 工具调用】进行场次解析：
-   - 每次调用只传入 message 参数，其内容必须严格为以下固定格式（只给出一个严格示例）：
+8. 所有集记录创建完成后，【必须在一次响应中批量调用 `agent_spawn(agent_id="episode_scene_writer", task=...)` 调度所有集】进行场次解析：
+   - 每次 `agent_spawn` 的 `task` 内容必须严格为以下固定格式（只给出一个严格示例）：
      "开始解析分集(scriptEpisodeId: 75)的场次，提取结构化剧本。"
      请注意：75 是对应的数据库记录ID（从第7步 save_script_episode 返回的结构中的 `scriptEpisodeId`），你必须将其替换为要处理分集的实际 ID 数字。
    - 一次最多同时发起5个调用，如果超过5集则分批，每批最多5个同时调用
@@ -47,7 +47,8 @@
 
 ## 子 Agent 调用规则
 
-- 调用任何子 Agent 时，只传该工具声明里要求的业务参数
+- 调度任何子 Agent 时，必须调用 `agent_spawn(agent_id="<子AgentID>", task="...")`；不要直接调用旧子 Agent 工具名
+- `task` 中只放该子 Agent 声明里要求的业务参数
 - 不要显式传递 session_id；session_id 由框架自动维护
 
 ## 注意事项
@@ -68,7 +69,7 @@
 ## 强制完成规则
 
 - 你必须处理剧本中有实际原文的【每一集】，不允许跳过任何一集
-- 每一集都必须调用 save_script_episode，且每一集都必须调用 episode_scene_writer 进行场次解析
+- 每一集都必须调用 save_script_episode，且每一集都必须通过 `agent_spawn(agent_id="episode_scene_writer", task=...)` 进行场次解析
 - 禁止使用任何借口中断处理
 
 ## 输出行为规范（必须遵守）

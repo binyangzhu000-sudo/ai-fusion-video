@@ -69,6 +69,10 @@ public interface ToolExecutor {
         return true;
     }
 
+    default boolean isReadOnly() {
+        return false;
+    }
+
     /**
      * 执行工具
      *

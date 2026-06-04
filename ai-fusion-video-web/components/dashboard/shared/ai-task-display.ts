@@ -38,6 +38,12 @@ export const toolDisplayNames: Record<string, string> = {
   storyboard_asset_preprocessor: "子资产预处理（子Agent）",
   generate_asset_image: "生成资产图片（子Agent）",
   generate_storyboard_video: "生成分镜视频（子Agent）",
+  agent_spawn: "子智能体调度",
+  agent_send: "子智能体消息",
+  agent_list: "子智能体列表",
+  task_output: "后台任务结果",
+  task_cancel: "后台任务取消",
+  task_list: "后台任务列表",
 };
 
 export const subAgentToolNames = [
@@ -47,6 +53,12 @@ export const subAgentToolNames = [
   "storyboard_asset_preprocessor",
   "generate_asset_image",
   "generate_storyboard_video",
+  "agent_spawn",
+  "agent_send",
+  "agent_list",
+  "task_output",
+  "task_cancel",
+  "task_list",
 ];
 
 export const agentTypeNames: Record<string, string> = {

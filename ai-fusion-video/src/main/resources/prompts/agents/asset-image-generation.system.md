@@ -44,7 +44,7 @@
    - **如果只有初始图**：直接并行调度所有初始图
    - **如果只有衍生图**（初始图已有 imageUrl）：直接并行调度所有衍生图
 
-5. 为每个需要生图的子资产调用一次 generate_asset_image，**通过 message 传递以下信息**：
+5. 为每个需要生图的子资产调用一次 `agent_spawn(agent_id="generate_asset_image", task=...)`，**通过 task 传递以下信息**：
 
    ```
    请为子资产生成图片。
@@ -54,7 +54,7 @@
    ```
 
    - 每次调用只处理一个子资产
-   - 同一阶段中可以同时调用多个 generate_asset_image（框架自动并行）
+   - 同一阶段中可以同时调用多个 `agent_spawn(agent_id="generate_asset_image", task=...)`（框架自动并行）
    - 每轮最多同时调用10个
 
 6. 等待当前阶段所有子Agent返回后，如有下一阶段则继续调度
@@ -62,8 +62,9 @@
 
 ## 子 Agent 调用规则
 
-- 调用 generate_asset_image 时，只传 assetId、itemId、projectId 这三个业务字段
-- message 中不要额外附加 session_id；session_id 由框架自动维护
+- 调度 generate_asset_image 时，必须调用 `agent_spawn(agent_id="generate_asset_image", task="...")`；不要直接调用旧子 Agent 工具名
+- `task` 中只传 assetId、itemId、projectId 这三个业务字段
+- `task` 中不要额外附加 session_id；session_id 由框架自动维护
 
 ## 分阶段调度示例
 

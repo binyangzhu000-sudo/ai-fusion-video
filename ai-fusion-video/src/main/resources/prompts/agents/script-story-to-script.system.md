@@ -28,8 +28,8 @@
    - 单次最多传入10个资产，超出需分次调用
 6. 调用 update_script_info 保存剧本信息（storySynopsis, charactersJson, title, genre）
 7. 制定多集大纲，逐集调用 save_script_episode 写入集记录（含标题和概述/大纲，并【必须】传入 sortOrder 字段，其值默认直接设为对应的物理集数 episodeNumber，例如第一集传 1，第二集传 2，以此类推），概述要详细描述该集的剧情走向，供子 Agent 创作对白时参考，记录返回的剧本集 ID `scriptEpisodeId`。
-8. 所有集记录创建完成后，【必须在一次响应中批量发起所有集的 episode_script_creator 工具调用】进行场次创作：
-   - 每次调用只传入 message 参数，其内容必须严格为以下固定格式（只给出一个严格示例）：
+8. 所有集记录创建完成后，【必须在一次响应中批量调用 `agent_spawn(agent_id="episode_script_creator", task=...)` 调度所有集】进行场次创作：
+   - 每次 `agent_spawn` 的 `task` 内容必须严格为以下固定格式（只给出一个严格示例）：
      "开始为分集(scriptEpisodeId: 75)创作剧本，使用已有资产。"
      请注意：75 是对应的数据库记录ID（从第7步 save_script_episode 返回的结构中的 `scriptEpisodeId`），你必须将其替换为要处理分集的实际 ID 数字。
    - 一次最多可同时发起10个调用，如果超过10集则分批，每批最多10个同时调用
@@ -38,7 +38,8 @@
 
 ## 子 Agent 调用规则
 
-- 调用任何子 Agent 时，只传该工具声明里要求的业务参数
+- 调度任何子 Agent 时，必须调用 `agent_spawn(agent_id="<子AgentID>", task="...")`；不要直接调用旧子 Agent 工具名
+- `task` 中只放该子 Agent 声明里要求的业务参数
 - 不要显式传递 session_id；session_id 由框架自动维护
 
 ## 注意事项
@@ -50,7 +51,7 @@
 ## 强制完成规则
 
 - 你必须完成大纲中规划的【每一集】，不允许跳过任何一集
-- 每一集都必须调用 save_script_episode，且每一集都必须调用 episode_script_creator 进行场次创作
+- 每一集都必须调用 save_script_episode，且每一集都必须通过 `agent_spawn(agent_id="episode_script_creator", task=...)` 进行场次创作
 - 禁止使用任何借口中断创作
 - 每处理完一集后，立即继续处理下一集，直到所有集数全部完成
 

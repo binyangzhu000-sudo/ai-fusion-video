@@ -9,7 +9,7 @@ import java.util.function.Supplier;
  * 支持集群部署——无论 cancel 请求打到哪个节点，所有节点都能通过 Redis 感知到取消状态。
  * <p>
  * 使用位置：
- * - {@link StreamingEventHook#onEvent} — 每个 Hook 事件触发时检查
+ * - {@link AgentScopeEventBridge} — 每个 AgentEvent 触发时检查
  * - {@link AgentScopeToolAdapter#callAsync} — 每次工具执行前检查
  */
 public class AgentCancellationToken {
