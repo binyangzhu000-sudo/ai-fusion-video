@@ -41,17 +41,37 @@ public class AgentScopeReadOnlyWorkspaceTools {
             "session_search",
             "session_list",
             "session_history");
+    private static final Set<String> DEFAULT_ROOT_FALLBACK_PREFIXES = Set.of(
+            "AGENTS.md",
+            "MEMORY.md",
+            "tools.json",
+            "skills",
+            "subagents",
+            "knowledge",
+            "memory",
+            "agents",
+            "plans",
+            "large_tool_results");
 
     private final AbstractFilesystem filesystem;
     private final AbstractFilesystem fallbackFilesystem;
+    private final Set<String> rootFallbackPrefixes;
 
     public AgentScopeReadOnlyWorkspaceTools(AbstractFilesystem filesystem) {
         this(filesystem, null);
     }
 
     public AgentScopeReadOnlyWorkspaceTools(AbstractFilesystem filesystem, AbstractFilesystem fallbackFilesystem) {
+        this(filesystem, fallbackFilesystem, Set.of());
+    }
+
+    public AgentScopeReadOnlyWorkspaceTools(
+            AbstractFilesystem filesystem,
+            AbstractFilesystem fallbackFilesystem,
+            Set<String> extraRootFallbackPrefixes) {
         this.filesystem = filesystem;
         this.fallbackFilesystem = fallbackFilesystem;
+        this.rootFallbackPrefixes = normalizeRootFallbackPrefixes(extraRootFallbackPrefixes);
     }
 
     @Tool(
@@ -398,11 +418,21 @@ public class AgentScopeReadOnlyWorkspaceTools {
     }
 
     private ReadResult readFirstAvailable(RuntimeContext ctx, String path, int offset, int limit) {
-        ReadResult primary = filesystem.read(ctx, path, offset, limit);
+        if (isForeignNamespacePath(ctx, path)) {
+            return ReadResult.fail("permission_denied");
+        }
+        String logicalPath = normalizeLogicalPath(ctx, path);
+        if (!canExposeRootFallbackPath(logicalPath)) {
+            return ReadResult.fail("permission_denied");
+        }
+        ReadResult primary = filesystem.read(ctx, logicalPath, offset, limit);
         if (hasContent(primary) || fallbackFilesystem == null) {
             return primary;
         }
-        ReadResult fallback = fallbackFilesystem.read(ctx, path, offset, limit);
+        if (!canUseRootFallback(path, logicalPath)) {
+            return primary;
+        }
+        ReadResult fallback = fallbackFilesystem.read(ctx, logicalPath, offset, limit);
         return hasContent(fallback) ? fallback : primary;
     }
 
@@ -415,68 +445,216 @@ public class AgentScopeReadOnlyWorkspaceTools {
 
     private List<FileInfo> globAll(RuntimeContext ctx, String pattern, String path) {
         Map<String, FileInfo> files = new LinkedHashMap<>();
-        collectGlob(files, filesystem, ctx, pattern, path);
-        collectGlob(files, fallbackFilesystem, ctx, pattern, path);
+        collectGlob(files, filesystem, ctx, pattern, path, false);
+        collectGlob(files, fallbackFilesystem, ctx, pattern, path, true);
         return new ArrayList<>(files.values());
     }
 
     private void collectGlob(Map<String, FileInfo> files, AbstractFilesystem fs,
-            RuntimeContext ctx, String pattern, String path) {
-        if (fs == null) {
+            RuntimeContext ctx, String pattern, String path, boolean rootFallback) {
+        if (fs == null || isForeignNamespacePath(ctx, path)) {
             return;
         }
-        GlobResult result = fs.glob(ctx, pattern, path);
+        String logicalPath = normalizeLogicalPath(ctx, path);
+        if (rootFallback && !canUseRootFallback(path, logicalPath)) {
+            return;
+        }
+        GlobResult result = fs.glob(ctx, pattern, logicalPath);
         if (!result.isSuccess() || result.matches() == null) {
             return;
         }
         for (FileInfo file : result.matches()) {
-            files.putIfAbsent(file.path(), file);
+            if (rootFallback && isNamespaceRootPath(ctx, file.path())) {
+                continue;
+            }
+            FileInfo normalized = normalizeFileInfo(ctx, file);
+            if (isForeignNamespacePath(ctx, normalized.path())
+                    || !canExposeRootFallbackPath(normalized.path())) {
+                continue;
+            }
+            files.putIfAbsent(normalized.path(), normalized);
         }
     }
 
     private List<FileInfo> lsAll(RuntimeContext ctx, String path) {
         Map<String, FileInfo> entries = new LinkedHashMap<>();
-        collectLs(entries, filesystem, ctx, path);
-        collectLs(entries, fallbackFilesystem, ctx, path);
+        collectLs(entries, filesystem, ctx, path, false);
+        collectLs(entries, fallbackFilesystem, ctx, path, true);
         return new ArrayList<>(entries.values());
     }
 
-    private void collectLs(Map<String, FileInfo> entries, AbstractFilesystem fs, RuntimeContext ctx, String path) {
-        if (fs == null) {
+    private void collectLs(Map<String, FileInfo> entries, AbstractFilesystem fs,
+            RuntimeContext ctx, String path, boolean rootFallback) {
+        if (fs == null || isForeignNamespacePath(ctx, path)) {
             return;
         }
-        LsResult result = fs.ls(ctx, path);
+        String logicalPath = normalizeLogicalPath(ctx, path);
+        if (rootFallback && !canUseRootFallback(path, logicalPath)) {
+            return;
+        }
+        LsResult result = fs.ls(ctx, logicalPath);
         if (!result.isSuccess() || result.entries() == null) {
             return;
         }
         for (FileInfo entry : result.entries()) {
-            entries.putIfAbsent(entry.path(), entry);
+            if (rootFallback && isNamespaceRootPath(ctx, entry.path())) {
+                continue;
+            }
+            FileInfo normalized = normalizeFileInfo(ctx, entry);
+            if (isForeignNamespacePath(ctx, normalized.path())
+                    || !canExposeRootFallbackPath(normalized.path())) {
+                continue;
+            }
+            entries.putIfAbsent(normalized.path(), normalized);
         }
     }
 
     private List<GrepMatch> grepAll(RuntimeContext ctx, String pattern, String path, String glob) {
         List<GrepMatch> matches = new ArrayList<>();
         Set<String> seen = new LinkedHashSet<>();
-        collectGrep(matches, seen, filesystem, ctx, pattern, path, glob);
-        collectGrep(matches, seen, fallbackFilesystem, ctx, pattern, path, glob);
+        collectGrep(matches, seen, filesystem, ctx, pattern, path, glob, false);
+        collectGrep(matches, seen, fallbackFilesystem, ctx, pattern, path, glob, true);
         return matches;
     }
 
     private void collectGrep(List<GrepMatch> matches, Set<String> seen, AbstractFilesystem fs,
-            RuntimeContext ctx, String pattern, String path, String glob) {
-        if (fs == null) {
+            RuntimeContext ctx, String pattern, String path, String glob, boolean rootFallback) {
+        if (fs == null || isForeignNamespacePath(ctx, path)) {
             return;
         }
-        GrepResult result = fs.grep(ctx, pattern, path, glob);
+        String logicalPath = normalizeLogicalPath(ctx, path);
+        if (rootFallback && !canUseRootFallback(path, logicalPath)) {
+            return;
+        }
+        if (rootFallback && ".".equals(logicalPath)) {
+            for (String prefix : rootFallbackPrefixes) {
+                collectGrepAtPath(matches, seen, fs, ctx, pattern, prefix, glob, true);
+            }
+            return;
+        }
+        collectGrepAtPath(matches, seen, fs, ctx, pattern, logicalPath, glob, rootFallback);
+    }
+
+    private void collectGrepAtPath(List<GrepMatch> matches, Set<String> seen, AbstractFilesystem fs,
+            RuntimeContext ctx, String pattern, String logicalPath, String glob, boolean rootFallback) {
+        GrepResult result = fs.grep(ctx, pattern, logicalPath, glob);
         if (!result.isSuccess() || result.matches() == null) {
             return;
         }
         for (GrepMatch match : result.matches()) {
-            String key = match.path() + ":" + match.line() + ":" + match.text();
+            GrepMatch normalized = normalizeGrepMatch(ctx, match, rootFallback ? logicalPath : null);
+            if (isForeignNamespacePath(ctx, normalized.path())
+                    || !canExposeRootFallbackPath(normalized.path())) {
+                continue;
+            }
+            String key = normalized.path() + ":" + normalized.line() + ":" + normalized.text();
             if (seen.add(key)) {
-                matches.add(match);
+                matches.add(normalized);
             }
         }
+    }
+
+    private FileInfo normalizeFileInfo(RuntimeContext ctx, FileInfo file) {
+        String path = normalizeReturnedPath(ctx, file.path());
+        return new FileInfo(path, file.isDirectory(), file.size(), file.modifiedAt());
+    }
+
+    private GrepMatch normalizeGrepMatch(RuntimeContext ctx, GrepMatch match, String defaultPath) {
+        String rawPath = match.path();
+        if (StrUtil.isNotBlank(defaultPath) && ".".equals(cleanRelativePath(rawPath))) {
+            rawPath = defaultPath;
+        }
+        return new GrepMatch(normalizeReturnedPath(ctx, rawPath), match.line(), match.text());
+    }
+
+    private String normalizeReturnedPath(RuntimeContext ctx, String path) {
+        return normalizeLogicalPath(ctx, path);
+    }
+
+    private String normalizeLogicalPath(RuntimeContext ctx, String path) {
+        String cleaned = cleanRelativePath(path);
+        String userId = ctx != null ? ctx.getUserId() : null;
+        if (StrUtil.isNotBlank(userId) && cleaned.equals(userId)) {
+            return ".";
+        }
+        if (StrUtil.isNotBlank(userId) && cleaned.startsWith(userId + "/")) {
+            String stripped = cleaned.substring(userId.length() + 1);
+            return StrUtil.isBlank(stripped) ? "." : stripped;
+        }
+        return cleaned;
+    }
+
+    private boolean isForeignNamespacePath(RuntimeContext ctx, String path) {
+        String userId = ctx != null ? ctx.getUserId() : null;
+        if (StrUtil.isBlank(userId) || StrUtil.isBlank(path)) {
+            return false;
+        }
+        String cleaned = cleanRelativePath(path);
+        if (cleaned.isBlank()) {
+            return false;
+        }
+        int slash = cleaned.indexOf('/');
+        String firstSegment = slash > 0 ? cleaned.substring(0, slash) : cleaned;
+        return firstSegment.matches("\\d+") && !firstSegment.equals(userId);
+    }
+
+    private boolean canUseRootFallback(String originalPath, String logicalPath) {
+        if (fallbackFilesystem == null || StrUtil.isBlank(logicalPath)) {
+            return false;
+        }
+        String cleanedOriginal = cleanRelativePath(originalPath);
+        if (!cleanedOriginal.equals(logicalPath)) {
+            return false;
+        }
+        return canExposeRootFallbackPath(logicalPath);
+    }
+
+    private boolean canExposeRootFallbackPath(String path) {
+        String cleaned = cleanRelativePath(path);
+        String firstSegment = cleaned;
+        int slash = firstSegment.indexOf('/');
+        if (slash >= 0) {
+            firstSegment = firstSegment.substring(0, slash);
+        }
+        return ".".equals(firstSegment) || rootFallbackPrefixes.contains(firstSegment);
+    }
+
+    private boolean isNamespaceRootPath(RuntimeContext ctx, String path) {
+        String userId = ctx != null ? ctx.getUserId() : null;
+        if (StrUtil.isBlank(userId) || StrUtil.isBlank(path)) {
+            return false;
+        }
+        String cleaned = cleanRelativePath(path);
+        return cleaned.matches("\\d+");
+    }
+
+    private Set<String> normalizeRootFallbackPrefixes(Set<String> extraPrefixes) {
+        Set<String> prefixes = new LinkedHashSet<>(DEFAULT_ROOT_FALLBACK_PREFIXES);
+        if (extraPrefixes != null) {
+            extraPrefixes.stream()
+                    .map(AgentScopeReadOnlyWorkspaceTools::firstPathSegment)
+                    .filter(StrUtil::isNotBlank)
+                    .forEach(prefixes::add);
+        }
+        return Set.copyOf(prefixes);
+    }
+
+    private static String firstPathSegment(String path) {
+        String cleaned = cleanRelativePath(path);
+        if (".".equals(cleaned)) {
+            return "";
+        }
+        int slash = cleaned.indexOf('/');
+        return slash >= 0 ? cleaned.substring(0, slash) : cleaned;
+    }
+
+    private static String cleanRelativePath(String path) {
+        String cleaned = StrUtil.blankToDefault(path, ".")
+                .replace('\\', '/')
+                .replaceFirst("^/+", "");
+        Path normalized = Path.of(cleaned).normalize();
+        String relative = normalized.toString().replace('\\', '/').replaceFirst("^/+", "");
+        return StrUtil.isBlank(relative) ? "." : relative;
     }
 
     private String truncate(String text, int maxChars) {

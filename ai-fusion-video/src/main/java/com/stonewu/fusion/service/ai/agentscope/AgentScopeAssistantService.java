@@ -54,9 +54,11 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -785,7 +787,10 @@ public class AgentScopeAssistantService {
                         return StrUtil.isBlank(uid) ? List.of() : List.of(uid);
                     });
             AbstractFilesystem rootFallbackFilesystem = filesystemSpec.toFilesystem(workspacePath, rc -> List.of());
-            toolkit.registerTool(new AgentScopeReadOnlyWorkspaceTools(readOnlyFilesystem, rootFallbackFilesystem));
+            toolkit.registerTool(new AgentScopeReadOnlyWorkspaceTools(
+                    readOnlyFilesystem,
+                    rootFallbackFilesystem,
+                    readOnlyWorkspaceRootPrefixes()));
         }
 
         // 注册普通工具（通过 AgentScopeToolAdapter 适配）
@@ -798,6 +803,15 @@ public class AgentScopeAssistantService {
                 filteredTools.size(), includeWorkspaceTools);
 
         return toolkit;
+    }
+
+    private Set<String> readOnlyWorkspaceRootPrefixes() {
+        Set<String> prefixes = new LinkedHashSet<>();
+        AgentScopeHarnessProperties.ToolResultEviction eviction = harnessProperties.getToolResultEviction();
+        if (eviction != null && eviction.isEnabled() && StrUtil.isNotBlank(eviction.getEvictionPath())) {
+            prefixes.add(eviction.getEvictionPath());
+        }
+        return prefixes;
     }
 
     private List<AiAgentDefinition.SubAgentToolDef> filterSubAgentTools(AiChatReqVO reqVO) {

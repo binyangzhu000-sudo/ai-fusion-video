@@ -20,6 +20,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
@@ -135,6 +136,11 @@ class AgentScopeToolAdapterTests {
         Files.createDirectories(tempDir.resolve("memory"));
         Files.writeString(tempDir.resolve("memory").resolve("root.md"),
                 "root-only fact\n", StandardCharsets.UTF_8);
+        Files.writeString(tempDir.resolve("secret.md"),
+                "root secret should stay hidden\n", StandardCharsets.UTF_8);
+        Files.createDirectories(tempDir.resolve("custom_evictions"));
+        Files.writeString(tempDir.resolve("custom_evictions").resolve("result.txt"),
+                "custom evicted result\n", StandardCharsets.UTF_8);
 
         Path userMemoryDir = tempDir.resolve("7").resolve("memory");
         Files.createDirectories(userMemoryDir);
@@ -144,6 +150,9 @@ class AgentScopeToolAdapterTests {
         Files.createDirectories(userSessionDir);
         Files.writeString(userSessionDir.resolve("s2.log.jsonl"),
                 "{\"role\":\"user\",\"content\":\"namespaced-session\"}\n", StandardCharsets.UTF_8);
+        Files.createDirectories(tempDir.resolve("8"));
+        Files.writeString(tempDir.resolve("8").resolve("MEMORY.md"),
+                "other-user-secret\n", StandardCharsets.UTF_8);
 
         AbstractFilesystem namespacedFilesystem = new LocalFilesystemSpec()
                 .project(tempDir)
@@ -155,12 +164,43 @@ class AgentScopeToolAdapterTests {
                 .toFilesystem(tempDir, rc -> List.of());
         AgentScopeReadOnlyWorkspaceTools tools =
                 new AgentScopeReadOnlyWorkspaceTools(namespacedFilesystem, rootFallbackFilesystem);
+        AgentScopeReadOnlyWorkspaceTools customEvictionTools =
+                new AgentScopeReadOnlyWorkspaceTools(
+                        namespacedFilesystem,
+                        rootFallbackFilesystem,
+                        Set.of("/custom_evictions"));
         RuntimeContext userContext = RuntimeContext.builder().userId("7").build();
 
         assertTrue(tools.readFile(userContext, "MEMORY.md", 0, 0).contains("Root fallback memory"));
+        assertTrue(customEvictionTools.readFile(userContext, "custom_evictions/result.txt", 0, 0)
+                .contains("custom evicted result"));
         assertTrue(tools.memorySearch(userContext, "user-only").contains("user.md"));
         assertTrue(tools.memorySearch(userContext, "root-only").contains("root.md"));
         assertTrue(tools.sessionSearch(userContext, "namespaced-session", "main_agent", 5)
                 .contains("s2.log.jsonl"));
+        assertTrue(!tools.sessionSearch(userContext, "namespaced-session", "main_agent", 5)
+                .contains("/7/"));
+        assertTrue(!tools.readFile(userContext, "/8/MEMORY.md", 0, 0)
+                .contains("other-user-secret"));
+        assertTrue(!tools.readFile(userContext, "memory/../8/MEMORY.md", 0, 0)
+                .contains("other-user-secret"));
+        assertTrue(!tools.readFile(userContext, "secret.md", 0, 0)
+                .contains("root secret"));
+        assertTrue(!tools.grepFiles(userContext, "other-user-secret", ".", null)
+                .contains("other-user-secret"));
+        assertTrue(!tools.grepFiles(userContext, "other-user-secret", "memory/../8", null)
+                .contains("other-user-secret"));
+        String rootSecretSearch = tools.grepFiles(userContext, "root secret", ".", null);
+        assertTrue(!rootSecretSearch.contains("root secret"), rootSecretSearch);
+        assertTrue(!tools.globFiles(userContext, "**/*.md", ".")
+                .contains("8/MEMORY.md"));
+        assertTrue(!tools.globFiles(userContext, "**/*.md", ".")
+                .contains("secret.md"));
+        assertTrue(!tools.listFiles(userContext, ".")
+                .contains("[DIR]  8"));
+        assertTrue(!tools.listFiles(userContext, ".")
+                .contains("[DIR]  7"));
+        assertTrue(!tools.listFiles(userContext, ".")
+                .contains("secret.md"));
     }
 }
