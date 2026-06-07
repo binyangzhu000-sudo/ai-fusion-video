@@ -24,6 +24,7 @@ export interface AiChatReq {
 export type OutputType =
   | "REASONING"
   | "CONTENT"
+  | "CONTENT_REPLACE"
   | "TOOL_CALL"
   | "TOOL_FINISHED"
   | "SUB_AGENT_FINISHED"

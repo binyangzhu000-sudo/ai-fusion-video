@@ -30,10 +30,12 @@ import io.agentscope.core.message.ToolUseBlock;
 import lombok.extern.slf4j.Slf4j;
 import reactor.core.publisher.Sinks;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 /**
  * Bridges AgentScope events into the application's SSE payloads.
@@ -68,7 +70,24 @@ public class AgentScopeEventBridge {
     private final Set<String> legacyParentToolCallIdsWithChildEvents = ConcurrentHashMap.newKeySet();
     /** 记录存在并行冲突的 agentId（同一 agentId 对应多个不同 toolCallId） */
     private final Set<String> legacyAgentIdCollisions = ConcurrentHashMap.newKeySet();
+    /** 并行 spawn 时，agentId → 所有对应的 toolCallId（有序） */
+    private final ConcurrentHashMap<String, CopyOnWriteArrayList<String>> legacyAgentIdToToolCallIdList = new ConcurrentHashMap<>();
+    /** 已被认领（绑定到某个 sessionId）的 toolCallId */
+    private final Set<String> legacyClaimedToolCallIds = ConcurrentHashMap.newKeySet();
     private volatile String latestLegacyRootToolCallId;
+    /** TOOL_CALL 已发但 TOOL_FINISHED 未到的工具调用 ID（跨 scope，因为 ToolUseBlock 和 ToolResultBlock 可能来自不同 agentName） */
+    private final Set<String> pendingToolCallIds = ConcurrentHashMap.newKeySet();
+    /** 已通过 TOOL_FINISHED 发送的工具结果文本（跨 scope） */
+    private final Set<String> emittedToolResults = ConcurrentHashMap.newKeySet();
+    /** 真实 toolCallId 到合成 toolCallId 的重定向映射 */
+    private final ConcurrentHashMap<String, String> legacyToolCallRedirects = new ConcurrentHashMap<>();
+
+    private String resolveRedirectedId(String id) {
+        if (StrUtil.isBlank(id)) {
+            return id;
+        }
+        return legacyToolCallRedirects.getOrDefault(id, id);
+    }
 
     public AgentScopeEventBridge(Sinks.Many<AiChatStreamRespVO> eventSink,
             String conversationId,
@@ -100,6 +119,7 @@ public class AgentScopeEventBridge {
             return;
         }
 
+        parentToolCallId = resolveRedirectedId(parentToolCallId);
         EventScope scope = scopes.computeIfAbsent(scopeKey(parentToolCallId, agentName), key -> new EventScope());
 
         if (event instanceof ThinkingBlockDeltaEvent e) {
@@ -109,19 +129,19 @@ public class AgentScopeEventBridge {
         } else if (event instanceof TextBlockDeltaEvent e) {
             handleTextDelta(scope, agentName, parentToolCallId, e.getDelta());
         } else if (event instanceof ToolCallStartEvent e) {
-            scope.toolCall(e.getToolCallId()).name = e.getToolCallName();
+            scope.toolCall(resolveRedirectedId(e.getToolCallId())).name = e.getToolCallName();
         } else if (event instanceof ToolCallDeltaEvent e) {
-            scope.toolCall(e.getToolCallId()).arguments.append(StrUtil.nullToEmpty(e.getDelta()));
+            scope.toolCall(resolveRedirectedId(e.getToolCallId())).arguments.append(StrUtil.nullToEmpty(e.getDelta()));
         } else if (event instanceof ToolCallEndEvent e) {
-            emitToolCall(scope, agentName, parentToolCallId, e.getToolCallId());
+            emitToolCall(scope, agentName, parentToolCallId, resolveRedirectedId(e.getToolCallId()));
         } else if (event instanceof ToolResultStartEvent e) {
-            scope.toolCall(e.getToolCallId()).name = e.getToolCallName();
+            scope.toolCall(resolveRedirectedId(e.getToolCallId())).name = e.getToolCallName();
         } else if (event instanceof ToolResultTextDeltaEvent e) {
-            scope.toolCall(e.getToolCallId()).result.append(StrUtil.nullToEmpty(e.getDelta()));
+            scope.toolCall(resolveRedirectedId(e.getToolCallId())).result.append(StrUtil.nullToEmpty(e.getDelta()));
         } else if (event instanceof ToolResultDataDeltaEvent e) {
-            scope.toolCall(e.getToolCallId()).result.append(JSONUtil.toJsonStr(e.getData()));
+            scope.toolCall(resolveRedirectedId(e.getToolCallId())).result.append(JSONUtil.toJsonStr(e.getData()));
         } else if (event instanceof ToolResultEndEvent e) {
-            emitToolFinished(scope, agentName, parentToolCallId, e.getToolCallId(), e.getState());
+            emitToolFinished(scope, agentName, parentToolCallId, resolveRedirectedId(e.getToolCallId()), e.getState());
         } else if (event instanceof AgentEndEvent && isSubAgent(agentName)) {
             emitEvent(new AiChatStreamRespVO()
                     .setMessageId(messageId)
@@ -148,10 +168,19 @@ public class AgentScopeEventBridge {
         String parentToolCallId = subAgentEvent
                 ? resolveLegacyParentToolCallId(event, forcedParentToolCallId, agentName)
                 : null;
+        parentToolCallId = resolveRedirectedId(parentToolCallId);
         if (subAgentEvent && StrUtil.isNotBlank(parentToolCallId)) {
             legacyParentToolCallIdsWithChildEvents.add(parentToolCallId);
         }
         EventScope scope = scopes.computeIfAbsent(scopeKey(parentToolCallId, agentName), key -> new EventScope());
+
+        // 收到总结、结果、结束事件时重置流式过滤状态
+        if (event.getType() == EventType.AGENT_RESULT 
+                || event.getType() == EventType.SUMMARY 
+                || event.getType() == EventType.TOOL_RESULT
+                || event.isLast()) {
+            scope.filteringToolCallJsonStream = false;
+        }
 
         Msg message = event.getMessage();
         if (message != null && message.getContent() != null) {
@@ -202,6 +231,7 @@ public class AgentScopeEventBridge {
                             resolveLegacyAgentName(childEvent, inheritedAgentName, true)));
             String parentToolCallId = resolveForwardedParentToolCallId(
                     toolResultBlock, childEvent, inheritedParentToolCallId, metadata, agentName);
+            parentToolCallId = resolveRedirectedId(parentToolCallId);
             handleLegacyEvent(childEvent, parentToolCallId, agentName);
             forwarded = true;
         }
@@ -252,22 +282,85 @@ public class AgentScopeEventBridge {
             TextBlock textBlock,
             Event event) {
         String text = textBlock.getText();
-        if (StrUtil.isBlank(text)) {
+        if (StrUtil.isEmpty(text)) {
+            return;
+        }
+
+        // REASONING isLast=true 事件包含该轮推理的完整、格式正确的文本。
+        // 增量 chunk 可能丢失部分换行符（如 "\n-" 变成 "-"），而 isLast 文本是权威数据。
+        // 用完整文本替换之前 chunk 累积的 legacyContent，并通知持久化层替换 accumulator 内容。
+        // 然后 flush 缓冲的 TOOL_CALL 事件，确保前端同时收到格式修正和工具调用。
+        if (event.isLast() && event.getType() == EventType.REASONING) {
+            String previousContent = scope.legacyContent.toString();
+            scope.legacyContent.setLength(0);
+            scope.legacyContent.append(text);
+
+            // 只有当完整文本与 chunk 累积文本不同时才发送替换事件
+            if (!text.equals(previousContent) && StrUtil.isNotBlank(previousContent)) {
+                log.debug("[handleLegacyTextBlock] REASONING isLast=true 替换 legacyContent: " +
+                                "oldLen={}, newLen={}, agent={}, parentTcId={}",
+                        previousContent.length(), text.length(), agentName, parentToolCallId);
+                emitEvent(new AiChatStreamRespVO()
+                        .setMessageId(messageId)
+                        .setConversationId(conversationId)
+                        .setOutputType("CONTENT_REPLACE")
+                        .setContent(text)
+                        .setParentToolCallId(parentToolCallId)
+                        .setAgentName(agentName)
+                        .setFinished(false));
+            }
+
+            // 不再发送常规 CONTENT 事件（chunk 已经流式推送过），避免重复
+            return;
+        }
+
+        // 识别流式工具调用 JSON 并开启过滤状态
+        if (event.getType() == EventType.REASONING) {
+            String trimmed = text.trim();
+            if (!scope.filteringToolCallJsonStream) {
+                if (trimmed.startsWith("{") 
+                        || trimmed.startsWith("```json")
+                        || trimmed.contains("\"name\":")
+                        || trimmed.contains("\"arguments\":")
+                        || trimmed.contains("\"agent_spawn\"")
+                        || trimmed.contains("\"agent_send\"")) {
+                    scope.filteringToolCallJsonStream = true;
+                    log.info("[AgentScopeEventBridge] 识别到流式工具调用 JSON 开始，开启过滤状态: text={}", text);
+                }
+            }
+        }
+
+        // 处于工具调用 JSON 流式传输期间，直接忽略/过滤该文本
+        if (scope.filteringToolCallJsonStream) {
             return;
         }
 
         String delta = legacyContentDelta(scope, text, event);
-        if (StrUtil.isBlank(delta)) {
+        if (StrUtil.isEmpty(delta)) {
             return;
         }
 
         handleTextDelta(scope, agentName, parentToolCallId, delta);
         scope.legacyContent.append(delta);
+
+        // 诊断日志：追踪每个被发送的文本块来源
+        if (log.isDebugEnabled()) {
+            EventSource source = event.getSource();
+            String preview = delta.length() > 80 ? delta.substring(0, 80) + "..." : delta;
+            preview = preview.replace("\n", "\\n").replace("\r", "\\r");
+            log.debug("[TextBlock EMITTED] type={}, isLast={}, source={}, depth={}, agent={}, parentTcId={}, " +
+                            "deltaLen={}, emittedLen={}, preview={}",
+                    event.getType(), event.isLast(),
+                    source != null ? source.getAgentId() : "null",
+                    source != null ? source.getDepth() : 0,
+                    agentName, parentToolCallId,
+                    delta.length(), scope.legacyContent.length(), preview);
+        }
     }
 
     private String legacyContentDelta(EventScope scope, String incomingText, Event event) {
         String emittedText = scope.legacyContent.toString();
-        if (StrUtil.isBlank(emittedText)) {
+        if (StrUtil.isEmpty(emittedText)) {
             return incomingText;
         }
 
@@ -285,123 +378,70 @@ public class AgentScopeEventBridge {
             return incomingText.substring(emittedText.length());
         }
 
-        boolean aggregateTextEvent = event.isLast()
-                || event.getType() == EventType.AGENT_RESULT
-                || event.getType() == EventType.SUMMARY;
-        if (!aggregateTextEvent) {
-            return incomingText;
-        }
-
-        if (emittedText.contains(incomingText)
-                || normalizeLegacyText(emittedText).contains(normalizeLegacyText(incomingText))) {
-            return "";
-        }
-
-        int overlapLength = commonSuffixPrefixLength(emittedText, incomingText);
-        int minimumUsefulOverlap = Math.min(24, Math.min(emittedText.length(), incomingText.length()));
-        if (overlapLength >= Math.max(8, minimumUsefulOverlap)) {
-            return incomingText.substring(overlapLength);
-        }
-
-        String prefixTrimmed = dropLeadingRepeatedLegacySegments(emittedText, incomingText);
+        String prefixTrimmed = extractNewTextByCoreCharPrefix(emittedText, incomingText);
         return collapseNearDuplicateSummarySegments(prefixTrimmed);
     }
 
-    private String normalizeLegacyText(String text) {
+    private String extractNewTextByCoreCharPrefix(String emittedText, String incomingText) {
+        if (emittedText == null || incomingText == null) {
+            return incomingText;
+        }
+        String normEmitted = normalizeCoreText(emittedText);
+        String normIncoming = normalizeCoreText(incomingText);
+
+        int matchLen = 0;
+        int maxLen = Math.min(normEmitted.length(), normIncoming.length());
+        while (matchLen < maxLen && normEmitted.charAt(matchLen) == normIncoming.charAt(matchLen)) {
+            matchLen++;
+        }
+
+        if (matchLen == 0) {
+            return incomingText;
+        }
+
+        int coreCount = 0;
+        int index = 0;
+        while (index < incomingText.length() && coreCount < matchLen) {
+            char ch = incomingText.charAt(index);
+            if (isCoreChar(ch)) {
+                coreCount++;
+            }
+            index++;
+        }
+
+        return incomingText.substring(index);
+    }
+
+    private String normalizeCoreText(String text) {
         if (text == null) {
             return "";
         }
-        return text.replaceAll("\\s+", "");
-    }
-
-    private int commonSuffixPrefixLength(String left, String right) {
-        if (StrUtil.isBlank(left) || StrUtil.isBlank(right)) {
-            return 0;
-        }
-        int max = Math.min(left.length(), right.length());
-        for (int length = max; length > 0; length--) {
-            if (left.regionMatches(left.length() - length, right, 0, length)) {
-                return length;
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < text.length(); i++) {
+            char ch = text.charAt(i);
+            if (isCoreChar(ch)) {
+                sb.append(ch);
             }
         }
-        return 0;
+        return sb.toString();
     }
 
-    private String dropLeadingRepeatedLegacySegments(String emittedText, String incomingText) {
-        String remaining = incomingText;
-        boolean droppedAny = false;
-        while (true) {
-            LegacyTextSegment segment = firstLegacyTextSegment(remaining);
-            if (segment == null || StrUtil.isBlank(segment.text())) {
-                return droppedAny ? "" : incomingText;
-            }
-            if (!isRepeatedLegacySegment(emittedText, segment.text())) {
-                break;
-            }
-            droppedAny = true;
-            remaining = remaining.substring(segment.endOffset());
-        }
-        return droppedAny ? remaining.stripLeading() : incomingText;
-    }
-
-    private LegacyTextSegment firstLegacyTextSegment(String text) {
-        if (StrUtil.isBlank(text)) {
-            return null;
-        }
-        int start = 0;
-        while (start < text.length() && Character.isWhitespace(text.charAt(start))) {
-            start++;
-        }
-        if (start >= text.length()) {
-            return null;
-        }
-
-        int newline = text.indexOf('\n', start);
-        int sentenceEnd = firstSentenceBoundary(text, start);
-        int end;
-        if (newline >= 0 && sentenceEnd >= 0) {
-            end = Math.min(newline + 1, sentenceEnd);
-        } else if (newline >= 0) {
-            end = newline + 1;
-        } else if (sentenceEnd >= 0) {
-            end = sentenceEnd;
-        } else {
-            end = text.length();
-        }
-        return new LegacyTextSegment(text.substring(start, end).trim(), end);
-    }
-
-    private int firstSentenceBoundary(String text, int start) {
-        for (int index = start; index < text.length(); index++) {
-            char ch = text.charAt(index);
-            if (ch == '。' || ch == '！' || ch == '？' || ch == '.' || ch == '!' || ch == '?') {
-                return index + 1;
-            }
-        }
-        return -1;
-    }
-
-    private boolean isRepeatedLegacySegment(String emittedText, String candidate) {
-        String normalizedCandidate = normalizeLegacyComparableText(candidate);
-        if (normalizedCandidate.length() < 6) {
-            return false;
-        }
-        String normalizedEmitted = normalizeLegacyComparableText(emittedText);
-        if (normalizedEmitted.contains(normalizedCandidate)) {
+    private boolean isCoreChar(char ch) {
+        // \n 是有意义的格式字符（markdown 列表、段落分隔），不能忽略
+        if (ch == '\n') {
             return true;
         }
-        for (String emittedSegment : emittedText.split("\\R+")) {
-            String normalizedSegment = normalizeLegacyComparableText(emittedSegment);
-            if (normalizedSegment.length() < 6) {
-                continue;
-            }
-            double similarity = legacySimilarity(normalizedCandidate, normalizedSegment);
-            if (similarity >= 0.82) {
-                return true;
-            }
+        if (Character.isWhitespace(ch)) {
+            return false;
         }
-        return false;
+        return ch != '*' && ch != '_' && ch != '`' && ch != '#' && ch != '>' && ch != '-' && ch != '+'
+                && ch != '●' && ch != '•' && ch != '·' && ch != ':' && ch != '：' && ch != ',' && ch != '，'
+                && ch != ';' && ch != '；' && ch != '(' && ch != ')' && ch != '（' && ch != '）'
+                && ch != '[' && ch != ']' && ch != '【' && ch != '】' && ch != '"' && ch != '\''
+                && ch != '“' && ch != '”' && ch != '‘' && ch != '’' && ch != '。' && ch != '！'
+                && ch != '？' && ch != '.' && ch != '!' && ch != '?' && ch != '\\';
     }
+
 
     private String collapseNearDuplicateSummarySegments(String text) {
         if (StrUtil.isBlank(text) || !text.contains("汇总")) {
@@ -473,7 +513,9 @@ public class AgentScopeEventBridge {
             String agentName,
             String parentToolCallId,
             ToolUseBlock toolUseBlock) {
+        scope.filteringToolCallJsonStream = false;
         String toolCallId = normalizeToolCallId(toolUseBlock.getId(), toolUseBlock.getName());
+        toolCallId = resolveRedirectedId(toolCallId);
         ToolCallAccumulator toolCall = scope.toolCall(toolCallId);
         toolCall.name = resolveLegacyToolDisplayName(toolUseBlock, toolCall.name);
         toolCall.arguments.setLength(0);
@@ -489,12 +531,14 @@ public class AgentScopeEventBridge {
             String agentName,
             String parentToolCallId,
             ToolResultBlock toolResultBlock) {
+        scope.filteringToolCallJsonStream = false;
         Map<String, Object> metadata = toolResultBlock.getMetadata();
         if (metadata != null && metadata.containsKey(SUBAGENT_EVENT_METADATA)) {
             return;
         }
 
         String toolCallId = normalizeToolCallId(toolResultBlock.getId(), toolResultBlock.getName());
+        toolCallId = resolveRedirectedId(toolCallId);
         if (StrUtil.isBlank(toolCallId) || "unknown".equals(toolCallId)) {
             return;
         }
@@ -554,33 +598,81 @@ public class AgentScopeEventBridge {
 
         EventSource source = event.getSource();
         if (source != null) {
-            String mappedByKey = legacyAgentKeyToParentToolCallId.get(source.getAgentKey());
-            if (StrUtil.isNotBlank(mappedByKey)) {
-                return mappedByKey;
-            }
-            String mappedBySession = legacySessionIdToParentToolCallId.get(source.getSessionId());
-            if (StrUtil.isNotBlank(mappedBySession)) {
-                return mappedBySession;
-            }
-            // 并行同类型子 agent 时 agentId 不唯一，跳过此映射走 ensureSyntheticParentToolCall
-            if (!legacyAgentIdCollisions.contains(source.getAgentId())) {
+            // 在 50ms 时间窗内重试认领/获取映射（每 5ms 重试一次），以解决主线程 ToolUseBlock 到达慢的时序差
+            for (int i = 0; i < 10; i++) {
+                String mappedByKey = legacyAgentKeyToParentToolCallId.get(source.getAgentKey());
+                if (StrUtil.isNotBlank(mappedByKey)) {
+                    legacyClaimedToolCallIds.add(mappedByKey);
+                    return mappedByKey;
+                }
+                String mappedBySession = legacySessionIdToParentToolCallId.get(source.getSessionId());
+                if (StrUtil.isNotBlank(mappedBySession)) {
+                    legacyClaimedToolCallIds.add(mappedBySession);
+                    return mappedBySession;
+                }
+                // 优先尝试认领下一个空闲的 toolCallId
+                String claimed = claimNextToolCallForSession(source);
+                if (StrUtil.isNotBlank(claimed)) {
+                    return claimed;
+                }
+                // 尝试直接使用 fallback 映射
                 String mappedByAgentId = legacyAgentIdToParentToolCallId.get(source.getAgentId());
                 if (StrUtil.isNotBlank(mappedByAgentId)) {
-                    return mappedByAgentId;
+                    // 认领并锁定映射，绑定到当前 session 防止其他子 Agent 抢占
+                    if (legacyClaimedToolCallIds.add(mappedByAgentId)) {
+                        if (StrUtil.isNotBlank(source.getSessionId())) {
+                            legacySessionIdToParentToolCallId.put(source.getSessionId(), mappedByAgentId);
+                        }
+                        if (StrUtil.isNotBlank(source.getAgentKey())) {
+                            legacyAgentKeyToParentToolCallId.put(source.getAgentKey(), mappedByAgentId);
+                        }
+                        return mappedByAgentId;
+                    }
+                }
+
+                // 没找到，说明主线程 ToolUseBlock 可能还在排队，睡 5 毫秒后重试
+                try {
+                    Thread.sleep(5);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
                 }
             }
         }
 
-        // 并行同类型子 agent 时不走 latest fallback，直接创建合成节点以按 sessionId 区分
-        boolean agentIdCollision = source != null
-                && legacyAgentIdCollisions.contains(source.getAgentId());
-        if (!agentIdCollision
-                && StrUtil.isNotBlank(latestLegacyRootToolCallId)
-                && legacyActiveRootToolCallIds.contains(latestLegacyRootToolCallId)) {
+        if (StrUtil.isNotBlank(latestLegacyRootToolCallId)
+                && legacyActiveRootToolCallIds.contains(latestLegacyRootToolCallId)
+                && !legacyClaimedToolCallIds.contains(latestLegacyRootToolCallId)) {
             return latestLegacyRootToolCallId;
         }
 
         return ensureSyntheticParentToolCall(source, agentName);
+    }
+
+    private String claimNextToolCallForSession(EventSource source) {
+        if (source == null) {
+            return null;
+        }
+        String agentId = source.getAgentId();
+        CopyOnWriteArrayList<String> toolCallIds = legacyAgentIdToToolCallIdList.get(agentId);
+        if (toolCallIds == null || toolCallIds.isEmpty()) {
+            return null;
+        }
+
+        // 尝试从列表中认领下一个未被占用的 toolCallId
+        for (String tc : toolCallIds) {
+            if (legacyClaimedToolCallIds.add(tc)) {
+                // 认领成功，建立双向映射
+                if (StrUtil.isNotBlank(source.getSessionId())) {
+                    legacySessionIdToParentToolCallId.put(source.getSessionId(), tc);
+                }
+                if (StrUtil.isNotBlank(source.getAgentKey())) {
+                    legacyAgentKeyToParentToolCallId.put(source.getAgentKey(), tc);
+                }
+                return tc;
+            }
+        }
+        return null;
     }
 
     private String ensureSyntheticParentToolCall(EventSource source, String agentName) {
@@ -592,6 +684,15 @@ public class AgentScopeEventBridge {
         String parentToolCallId = "subagent:" + StrUtil.blankToDefault(sourceKey, "unknown");
         if (parentToolCallId.length() > 120) {
             parentToolCallId = StrUtil.sub(parentToolCallId, 0, 120);
+        }
+
+        if (source != null) {
+            if (StrUtil.isNotBlank(source.getSessionId())) {
+                legacySessionIdToParentToolCallId.putIfAbsent(source.getSessionId().trim(), parentToolCallId);
+            }
+            if (StrUtil.isNotBlank(source.getAgentKey())) {
+                legacyAgentKeyToParentToolCallId.putIfAbsent(source.getAgentKey().trim(), parentToolCallId);
+            }
         }
 
         if (legacySyntheticParentToolCalls.putIfAbsent(parentToolCallId, Boolean.TRUE) == null) {
@@ -637,9 +738,27 @@ public class AgentScopeEventBridge {
                 // 同一 agentId 被多个不同 toolCallId spawn → 标记为并行冲突
                 legacyAgentIdCollisions.add(agentId);
             }
+            legacyAgentIdToToolCallIdList.computeIfAbsent(agentId, k -> new CopyOnWriteArrayList<>()).addIfAbsent(toolCallId);
         }
-        putIfNotBlank(legacyAgentKeyToParentToolCallId, stringValue(input.get("agent_key")), toolCallId);
-        putIfNotBlank(legacySessionIdToParentToolCallId, stringValue(input.get("session_id")), toolCallId);
+        
+        String agentKey = stringValue(input.get("agent_key"));
+        String sessionId = stringValue(input.get("session_id"));
+        if (StrUtil.isNotBlank(sessionId)) {
+            String existing = legacySessionIdToParentToolCallId.get(sessionId.trim());
+            if (StrUtil.isNotBlank(existing) && !existing.equals(toolCallId)) {
+                legacyToolCallRedirects.put(toolCallId, existing);
+            } else {
+                legacySessionIdToParentToolCallId.put(sessionId.trim(), toolCallId);
+            }
+        }
+        if (StrUtil.isNotBlank(agentKey)) {
+            String existing = legacyAgentKeyToParentToolCallId.get(agentKey.trim());
+            if (StrUtil.isNotBlank(existing) && !existing.equals(toolCallId)) {
+                legacyToolCallRedirects.put(toolCallId, existing);
+            } else {
+                legacyAgentKeyToParentToolCallId.put(agentKey.trim(), toolCallId);
+            }
+        }
     }
 
     private void completeLegacyRootToolCall(String toolCallId, String toolName, String resultText) {
@@ -647,9 +766,36 @@ public class AgentScopeEventBridge {
         if (StrUtil.equals(latestLegacyRootToolCallId, toolCallId)) {
             latestLegacyRootToolCallId = legacyActiveRootToolCallIds.stream().findFirst().orElse(null);
         }
-        putIfNotBlank(legacyAgentKeyToParentToolCallId, extractLineValue(resultText, "agent_key"), toolCallId);
-        putIfNotBlank(legacyAgentIdToParentToolCallId, extractLineValue(resultText, "agent_id"), toolCallId);
-        putIfNotBlank(legacySessionIdToParentToolCallId, extractLineValue(resultText, "session_id"), toolCallId);
+        
+        String agentKey = extractLineValue(resultText, "agent_key");
+        String agentId = extractLineValue(resultText, "agent_id");
+        String sessionId = extractLineValue(resultText, "session_id");
+        
+        if (StrUtil.isNotBlank(sessionId)) {
+            String existing = legacySessionIdToParentToolCallId.get(sessionId.trim());
+            if (StrUtil.isNotBlank(existing) && !existing.equals(toolCallId)) {
+                legacyToolCallRedirects.put(toolCallId, existing);
+            } else {
+                legacySessionIdToParentToolCallId.put(sessionId.trim(), toolCallId);
+            }
+        }
+        if (StrUtil.isNotBlank(agentKey)) {
+            String existing = legacyAgentKeyToParentToolCallId.get(agentKey.trim());
+            if (StrUtil.isNotBlank(existing) && !existing.equals(toolCallId)) {
+                legacyToolCallRedirects.put(toolCallId, existing);
+            } else {
+                legacyAgentKeyToParentToolCallId.put(agentKey.trim(), toolCallId);
+            }
+        }
+        if (StrUtil.isNotBlank(agentId)) {
+            legacyAgentIdToToolCallIdList.computeIfAbsent(agentId, k -> new CopyOnWriteArrayList<>()).addIfAbsent(toolCallId);
+            String existing = legacyAgentIdToParentToolCallId.get(agentId.trim());
+            if (StrUtil.isNotBlank(existing) && !existing.equals(toolCallId)) {
+                legacyToolCallRedirects.put(toolCallId, existing);
+            } else {
+                legacyAgentIdToParentToolCallId.put(agentId.trim(), toolCallId);
+            }
+        }
         if (StrUtil.isNotBlank(toolName)) {
             legacyAgentIdToParentToolCallId.putIfAbsent(toolName, toolCallId);
         }
@@ -797,6 +943,9 @@ public class AgentScopeEventBridge {
         legacyActiveRootToolCallIds.clear();
         legacyParentToolCallIdsWithChildEvents.clear();
         legacyAgentIdCollisions.clear();
+        legacyAgentIdToToolCallIdList.clear();
+        legacyClaimedToolCallIds.clear();
+        legacyToolCallRedirects.clear();
         latestLegacyRootToolCallId = null;
     }
 
@@ -887,6 +1036,7 @@ public class AgentScopeEventBridge {
                 .setAgentName(isSubAgent(agentName) ? agentName : null)
                 .setFinished(false));
     }
+
 
     private void emitToolFinished(EventScope scope, String agentName, String parentToolCallId,
             String toolCallId, ToolResultState state) {
@@ -991,8 +1141,10 @@ public class AgentScopeEventBridge {
     private static class EventScope {
         private volatile long reasoningStartTime;
         private volatile Long reasoningDurationMs;
+        private volatile boolean filteringToolCallJsonStream;
         private final StringBuilder legacyContent = new StringBuilder();
         private final ConcurrentHashMap<String, ToolCallAccumulator> toolCalls = new ConcurrentHashMap<>();
+
 
         ToolCallAccumulator toolCall(String toolCallId) {
             return toolCalls.computeIfAbsent(StrUtil.blankToDefault(toolCallId, "unknown"), id -> new ToolCallAccumulator());

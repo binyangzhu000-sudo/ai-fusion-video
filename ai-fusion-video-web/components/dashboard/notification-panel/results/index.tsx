@@ -32,6 +32,7 @@ export function ToolResultDisplay({
   toolName: string;
   content: string;
 }) {
+  console.log("=== ToolResultDisplay ===", { toolName, content });
   let parsed: unknown;
   try {
     parsed = JSON.parse(content);

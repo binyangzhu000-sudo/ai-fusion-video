@@ -399,6 +399,15 @@ function updateLastTimelineReasoningDuration(
   return timeline;
 }
 
+function findLastContentIndex(timeline: TimelineItem[]): number {
+  for (let i = timeline.length - 1; i >= 0; i--) {
+    if (timeline[i].type === "content") {
+      return i;
+    }
+  }
+  return -1;
+}
+
 /** 处理 SSE 事件的通用逻辑（支持子 Agent 嵌套） */
 function createEventHandler(
   id: string,
@@ -534,6 +543,42 @@ function createEventHandler(
                       text: content,
                     });
                   }
+                }
+              }
+              break;
+
+            // REASONING isLast=true 提供格式正确的完整文本，替换之前 chunk 累积的（缺换行的）content
+            case "CONTENT_REPLACE":
+              if (event.content) {
+                const replaceContent = event.content;
+                if (isSubAgent) {
+                  next.timeline = appendToToolChildren(
+                    next.timeline,
+                    event.parentToolCallId!,
+                    (children) => {
+                      for (let i = children.length - 1; i >= 0; i--) {
+                        if (children[i].type === "content") {
+                          return children.map((c, idx) =>
+                            idx === i && c.type === "content"
+                              ? { ...c, text: replaceContent }
+                              : c
+                          );
+                        }
+                      }
+                      return children;
+                    },
+                    {
+                      placeholderName: subAgentParentName(event),
+                      agentName: event.agentName,
+                    }
+                  );
+                } else {
+                  next.timeline = next.timeline.map((item, idx) => {
+                    if (idx === findLastContentIndex(next.timeline) && item.type === "content") {
+                      return { ...item, text: replaceContent };
+                    }
+                    return item;
+                  });
                 }
               }
               break;

@@ -9,6 +9,8 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
+import com.stonewu.fusion.controller.ai.vo.AiChatStreamRespVO;
+import java.util.ArrayList;
 
 /**
  * Agent 消息服务
@@ -67,6 +69,21 @@ public class AgentMessageService {
         return message;
     }
 
+    /**
+     * 更新已保存消息的 content 字段。
+     * 用于 REASONING isLast=true 事件提供格式正确的完整文本替换
+     * 之前由增量 chunk 累积的（可能丢失换行的）内容。
+     */
+    public void updateMessageContent(Long messageId, String content) {
+        if (messageId == null) {
+            return;
+        }
+        AgentMessage update = new AgentMessage();
+        update.setId(messageId);
+        update.setContent(content);
+        messageMapper.updateById(update);
+    }
+
     public AgentMessage saveToolCall(String conversationId, String toolName,
                                      String toolStatus, String content,
                                      String toolCallId, String parentToolCallId) {
@@ -83,5 +100,48 @@ public class AgentMessageService {
                 .build();
         messageMapper.insert(message);
         return message;
+    }
+
+    /**
+     * 从数据库中加载消息并转换为前端流式响应事件，用于 Redis 缓存失效后的强壮兜底。
+     */
+    public List<AiChatStreamRespVO> getHistoricEvents(String conversationId) {
+        List<AgentMessage> messages = listByConversation(conversationId);
+        List<AiChatStreamRespVO> events = new ArrayList<>();
+        for (AgentMessage msg : messages) {
+            if ("user".equals(msg.getRole())) {
+                events.add(new AiChatStreamRespVO()
+                        .setConversationId(conversationId)
+                        .setOutputType("CONTENT")
+                        .setContent(msg.getContent()));
+            } else if ("assistant".equals(msg.getRole())) {
+                if (StrUtil.isNotEmpty(msg.getReasoningContent())) {
+                    events.add(new AiChatStreamRespVO()
+                            .setConversationId(conversationId)
+                            .setOutputType("REASONING")
+                            .setReasoningContent(msg.getReasoningContent())
+                            .setReasoningDurationMs(msg.getReasoningDurationMs())
+                            .setParentToolCallId(msg.getParentToolCallId()));
+                }
+                if (StrUtil.isNotEmpty(msg.getContent())) {
+                    events.add(new AiChatStreamRespVO()
+                            .setConversationId(conversationId)
+                            .setOutputType("CONTENT")
+                            .setContent(msg.getContent())
+                            .setReasoningDurationMs(msg.getReasoningDurationMs())
+                            .setParentToolCallId(msg.getParentToolCallId()));
+                }
+            } else if ("tool".equals(msg.getRole())) {
+                events.add(new AiChatStreamRespVO()
+                        .setConversationId(conversationId)
+                        .setOutputType("TOOL_FINISHED")
+                        .setToolCallId(msg.getToolCallId())
+                        .setToolName(msg.getToolName())
+                        .setToolStatus(msg.getToolStatus())
+                        .setToolResult(msg.getContent())
+                        .setParentToolCallId(msg.getParentToolCallId()));
+            }
+        }
+        return events;
     }
 }

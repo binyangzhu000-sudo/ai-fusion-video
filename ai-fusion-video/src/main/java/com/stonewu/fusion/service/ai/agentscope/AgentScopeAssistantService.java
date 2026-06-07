@@ -11,6 +11,7 @@ import com.stonewu.fusion.controller.ai.vo.AiChatReqVO;
 import com.stonewu.fusion.controller.ai.vo.AiChatStreamRespVO;
 import com.stonewu.fusion.controller.ai.vo.AiReferenceVO;
 import com.stonewu.fusion.entity.ai.AiModel;
+import com.stonewu.fusion.entity.ai.AgentMessage;
 import com.stonewu.fusion.service.ai.AgentConversationService;
 import com.stonewu.fusion.service.ai.AgentMessageService;
 import com.stonewu.fusion.service.ai.AiAgentService;
@@ -535,12 +536,19 @@ public class AgentScopeAssistantService {
         // 1. 从 Replay List 读取合并后的历史事件
         AiStreamRedisService.ReplayResult replayResult =
                 aiStreamRedisService.getReplayEvents(conversationId);
-        Flux<AiChatStreamRespVO> historyFlux = Flux.fromIterable(replayResult.getEvents());
+        List<AiChatStreamRespVO> replayEvents = replayResult.getEvents();
+
+        Flux<AiChatStreamRespVO> historyFlux;
+        if (replayEvents != null && !replayEvents.isEmpty()) {
+            historyFlux = Flux.fromIterable(replayEvents);
+        } else {
+            log.info("[reconnectStream] Redis Replay 为空，从数据库加载历史: conversationId={}", conversationId);
+            historyFlux = Flux.fromIterable(messageService.getHistoricEvents(conversationId));
+        }
 
         // 2. 从 Redis Stream 的 lastStreamId 位置续传实时 token
         String lastStreamId = replayResult.getLastStreamId();
-        log.info("[reconnectStream] 回放 {} 条合并历史，从 Stream {} 续传",
-                replayResult.getEvents().size(), lastStreamId);
+        log.info("[reconnectStream] 回放历史，从 Stream {} 续传", lastStreamId);
         Flux<AiChatStreamRespVO> liveFlux =
                 aiStreamRedisService.subscribeFrom(conversationId, lastStreamId);
 
@@ -591,6 +599,22 @@ public class AgentScopeAssistantService {
                     }
                     if (StrUtil.isNotEmpty(event.getContent())) {
                         accumulator.appendContent(event.getContent());
+                    }
+                }
+
+                // REASONING isLast=true 的完整、格式正确的文本替换之前 chunk 累积的内容。
+                // 增量 chunk 可能丢失部分换行符，此事件提供权威的最终文本。
+                case "CONTENT_REPLACE" -> {
+                    if (StrUtil.isNotEmpty(event.getContent())) {
+                        // 如果 accumulator 已被 flush（content 为空），直接更新数据库中已保存的记录
+                        Long lastId = accumulator.getLastFlushedMessageId();
+                        if (accumulator.getContent() == null && lastId != null) {
+                            messageService.updateMessageContent(lastId, event.getContent());
+                            log.debug("[persistStreamEvent] CONTENT_REPLACE 更新已 flush 的数据库记录: " +
+                                    "messageId={}, newLen={}", lastId, event.getContent().length());
+                        } else {
+                            accumulator.replaceContent(event.getContent());
+                        }
                     }
                 }
 
@@ -657,14 +681,28 @@ public class AgentScopeAssistantService {
         Long duration = accumulator.getReasoningDurationMs();
 
         if (StrUtil.isNotEmpty(content) || reasoning != null) {
-            messageService.saveAssistantMessage(conversationId, content, reasoning,
-                    duration, parentToolCallId);
+            if (log.isDebugEnabled()) {
+                String preview = content != null && content.length() > 100
+                        ? content.substring(0, 100).replace("\n", "\\n").replace("\r", "\\r") + "..."
+                        : (content != null ? content.replace("\n", "\\n").replace("\r", "\\r") : "null");
+                log.debug("[flushAssistantMessage] conversationId={}, parentToolCallId={}, " +
+                                "contentLen={}, reasoningLen={}, preview={}",
+                        conversationId, parentToolCallId,
+                        content != null ? content.length() : 0,
+                        reasoning != null ? reasoning.length() : 0,
+                        preview);
+            }
+            AgentMessage savedMessage = messageService.saveAssistantMessage(
+                    conversationId, content, reasoning, duration, parentToolCallId);
+            if (savedMessage != null) {
+                accumulator.setLastFlushedMessageId(savedMessage.getId());
+            }
         }
 
         if (removeAfterFlush) {
             assistantAccumulators.remove(accumulatorKey);
         } else {
-            accumulator.clear();
+            accumulator.clearKeepLastFlushedId();
         }
     }
 
@@ -689,6 +727,7 @@ public class AgentScopeAssistantService {
         private final StringBuilder reasoning = new StringBuilder();
         private final StringBuilder content = new StringBuilder();
         private Long reasoningDurationMs;
+        private Long lastFlushedMessageId;
 
         void appendReasoning(String reasoningContent) {
             reasoning.append(reasoningContent);
@@ -698,10 +737,27 @@ public class AgentScopeAssistantService {
             content.append(contentText);
         }
 
+        /**
+         * 用完整文本替换之前累积的内容。用于 REASONING isLast=true 事件
+         * 提供格式正确的权威文本替换流式 chunk 累积的可能丢失换行的文本。
+         */
+        void replaceContent(String fullContent) {
+            content.setLength(0);
+            content.append(fullContent);
+        }
+
         void setReasoningDurationMs(Long durationMs) {
             if (durationMs != null && durationMs > 0) {
                 this.reasoningDurationMs = durationMs;
             }
+        }
+
+        void setLastFlushedMessageId(Long id) {
+            this.lastFlushedMessageId = id;
+        }
+
+        Long getLastFlushedMessageId() {
+            return lastFlushedMessageId;
         }
 
         String getContent() {
@@ -717,6 +773,17 @@ public class AgentScopeAssistantService {
         }
 
         void clear() {
+            reasoning.setLength(0);
+            content.setLength(0);
+            reasoningDurationMs = null;
+            lastFlushedMessageId = null;
+        }
+
+        /**
+         * 清空累积内容但保留 lastFlushedMessageId，
+         * 以便后续 CONTENT_REPLACE 能更新已 flush 的数据库记录。
+         */
+        void clearKeepLastFlushedId() {
             reasoning.setLength(0);
             content.setLength(0);
             reasoningDurationMs = null;

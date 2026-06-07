@@ -32,8 +32,32 @@ import {
   type TaskMediaLinkInfo,
 } from "./utils";
 
+/**
+ * 剥除所有格式化/标点字符，只留核心语义字符（中日韩字符、字母、数字）。
+ * 与后端 AgentScopeEventBridge.isCoreChar 对齐。
+ */
 function normalizeTimelineText(text?: string | null) {
-  return (text ?? "").replace(/\s+/g, "");
+  return (text ?? "")
+    .replace(/[\s*_`#>+\-•·●\[\]【】"'\u201c\u201d\u2018\u2019。！？.!?\\:：,，;；()（）]/g, "");
+}
+
+function textOverlapRatio(a: string, b: string): number {
+  if (!a || !b) return 0;
+  const shorter = a.length <= b.length ? a : b;
+  const longer = a.length > b.length ? a : b;
+  if (longer.includes(shorter)) return 1.0;
+  let common = 0;
+  const maxLen = Math.min(shorter.length, longer.length);
+  while (common < maxLen && shorter[common] === longer[common]) {
+    common++;
+  }
+  return common / shorter.length;
+}
+
+function isSimilarText(a: string, b: string): boolean {
+  if (!a || !b) return false;
+  if (a.includes(b) || b.includes(a)) return true;
+  return textOverlapRatio(a, b) >= 0.7;
 }
 
 function isEquivalentTimelineText(left?: string | null, right?: string | null) {
@@ -42,11 +66,7 @@ function isEquivalentTimelineText(left?: string | null, right?: string | null) {
   if (!normalizedLeft || !normalizedRight) {
     return false;
   }
-  return (
-    normalizedLeft === normalizedRight ||
-    normalizedLeft.includes(normalizedRight) ||
-    normalizedRight.includes(normalizedLeft)
-  );
+  return isSimilarText(normalizedLeft, normalizedRight);
 }
 
 function isRedundantAfterTool(
@@ -54,17 +74,26 @@ function isRedundantAfterTool(
   previousTool: Extract<TimelineItem, { type: "tool" }>
 ) {
   const normalizedText = normalizeTimelineText(text);
-  if (!normalizedText) {
+  if (!normalizedText || normalizedText.length < 10) {
     return false;
   }
-  if (previousTool.result && normalizeTimelineText(previousTool.result).includes(normalizedText)) {
-    return true;
+  if (previousTool.result) {
+    const nr = normalizeTimelineText(previousTool.result);
+    if (nr && isSimilarText(normalizedText, nr)) {
+      return true;
+    }
   }
   const childText = (previousTool.children ?? [])
     .filter((child): child is Extract<SubTimelineItem, { type: "content" }> => child.type === "content")
     .map((child) => child.text)
     .join("");
-  return !!childText && normalizeTimelineText(childText).includes(normalizedText);
+  if (childText) {
+    const nc = normalizeTimelineText(childText);
+    if (nc && isSimilarText(normalizedText, nc)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function TaskMediaLinks({ mediaLinks }: { mediaLinks: TaskMediaLinkInfo[] }) {
@@ -352,6 +381,34 @@ function SubAgentCard({
                   );
                 }
                 if (child.type === "content") {
+                  const trimmedText = child.text.trim();
+                  const looksLikeJson =
+                    trimmedText.length > 50 &&
+                    ((trimmedText.startsWith("{") && trimmedText.endsWith("}")) ||
+                      (trimmedText.startsWith("[") && trimmedText.endsWith("]")));
+                  if (looksLikeJson) {
+                    return null;
+                  }
+
+                  const normalizedChildText = normalizeTimelineText(child.text);
+                  if (normalizedChildText && normalizedChildText.length >= 10) {
+                    const isRedundant = children.some((other) => {
+                      if (other === child) return false;
+                      if (other.type === "tool" && other.result) {
+                        const nr = normalizeTimelineText(other.result);
+                        if (nr && isSimilarText(normalizedChildText, nr)) return true;
+                      }
+                      if (other.type === "content" && other !== child) {
+                        const nc = normalizeTimelineText(other.text);
+                        if (nc && nc.length > normalizedChildText.length && nc.includes(normalizedChildText)) return true;
+                      }
+                      return false;
+                    });
+                    if (isRedundant) {
+                      return null;
+                    }
+                  }
+
                   return (
                     <div
                       key={`sub-content-${index}`}
@@ -365,8 +422,8 @@ function SubAgentCard({
               })}
 
               {hasResult && (
-                <div className="text-xs leading-relaxed text-foreground/70">
-                  <StreamMarkdown content={renderedResult} compact />
+                <div className="border-t border-purple-500/10 pt-2">
+                  <ToolResultDisplay toolName={item.name} content={renderedResult} />
                 </div>
               )}
             </div>
@@ -453,12 +510,25 @@ export function MessageTimeline({
           );
         }
 
-        const prevItem = index > 0 ? timeline[index - 1] : null;
-        if (
-          prevItem?.type === "tool" &&
-          (prevItem.children?.length || prevItem.result) &&
-          isRedundantAfterTool(item.text, prevItem)
-        ) {
+        const hasToolsInTimeline = timeline.some((t) => t.type === "tool");
+        if (hasToolsInTimeline) {
+          const isRedundant = timeline.some(
+            (t) =>
+              t.type === "tool" &&
+              (t.children?.length || t.result) &&
+              isRedundantAfterTool(item.text, t)
+          );
+          if (isRedundant) {
+            return null;
+          }
+        }
+
+        const trimmedText = item.text.trim();
+        const looksLikeJson =
+          trimmedText.length > 50 &&
+          ((trimmedText.startsWith("{") && trimmedText.endsWith("}")) ||
+            (trimmedText.startsWith("[") && trimmedText.endsWith("]")));
+        if (looksLikeJson) {
           return null;
         }
 

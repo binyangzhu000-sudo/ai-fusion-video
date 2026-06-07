@@ -230,6 +230,46 @@ function appendContentToTimeline(
   return [...timeline, { type: "content", text: content }];
 }
 
+/**
+ * 用完整的格式正确文本替换 timeline 中最后一个 content 条目的文本。
+ * 用于 CONTENT_REPLACE 事件（REASONING isLast=true 提供的权威文本）。
+ */
+function replaceContentInTimeline(
+  timeline: TimelineItem[],
+  fullContent: string
+): TimelineItem[] {
+  // 从后往前找最后一个 content 类型条目
+  for (let i = timeline.length - 1; i >= 0; i--) {
+    const item = timeline[i];
+    if (item.type === "content") {
+      return timeline.map((t, idx) =>
+        idx === i && t.type === "content"
+          ? { ...t, text: fullContent }
+          : t
+      );
+    }
+  }
+  // 没有已存在的 content 条目，不添加（不应发生）
+  return timeline;
+}
+
+function replaceContentInSubTimeline(
+  children: SubTimelineItem[],
+  fullContent: string
+): SubTimelineItem[] {
+  for (let i = children.length - 1; i >= 0; i--) {
+    const item = children[i];
+    if (item.type === "content") {
+      return children.map((c, idx) =>
+        idx === i && c.type === "content"
+          ? { ...c, text: fullContent }
+          : c
+      );
+    }
+  }
+  return children;
+}
+
 export function reducePipelineEvent(
   prev: AgentPipelineState,
   event: AiChatStreamEvent
@@ -297,6 +337,29 @@ export function reducePipelineEvent(
           );
         } else {
           next.timeline = appendContentToTimeline(next.timeline, event.content);
+        }
+      }
+      return next;
+
+    case "CONTENT_REPLACE":
+      // REASONING isLast=true 提供格式正确的完整文本，替换之前 chunk 累积的（缺换行的）content
+      if (event.content) {
+        if (isSubAgent) {
+          next.timeline = appendToToolChildren(
+            next.timeline,
+            event.parentToolCallId!,
+            (children) =>
+              replaceContentInSubTimeline(children, event.content!),
+            {
+              placeholderName: subAgentParentName(event),
+              agentName: event.agentName,
+            }
+          );
+        } else {
+          next.timeline = replaceContentInTimeline(
+            next.timeline,
+            event.content
+          );
         }
       }
       return next;

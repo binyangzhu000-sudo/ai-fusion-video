@@ -97,11 +97,34 @@ public class TaskStreamService {
     }
 
     public Flux<AiChatStreamRespVO> reconnect(String taskId) {
+        log.info("[TaskStream] 重连任务流: taskId={}", taskId);
         String status = aiStreamRedisService.getStatus(taskId);
-        if ("NONE".equals(status)) {
+        if ("NONE".equals(status) || "COMPLETED".equals(status) || "ERROR".equals(status)) {
             return Flux.empty();
         }
-        return aiStreamRedisService.subscribe(taskId);
+
+        // 1. 从 Replay List 读取合并后的历史事件
+        AiStreamRedisService.ReplayResult replayResult =
+                aiStreamRedisService.getReplayEvents(taskId);
+        List<AiChatStreamRespVO> replayEvents = replayResult.getEvents();
+
+        Flux<AiChatStreamRespVO> historyFlux;
+        if (replayEvents != null && !replayEvents.isEmpty()) {
+            historyFlux = Flux.fromIterable(replayEvents);
+        } else {
+            // 兜底：从数据库加载并重建流式历史
+            log.info("[TaskStream] Redis Replay 为空，从数据库加载历史: taskId={}", taskId);
+            historyFlux = Flux.fromIterable(messageService.getHistoricEvents(taskId));
+        }
+
+        // 2. 从 Redis Stream 的 lastStreamId 位置续传实时 token
+        String lastStreamId = replayResult.getLastStreamId();
+        log.info("[TaskStream] 重连回放结束，从 Stream {} 续传", lastStreamId);
+        Flux<AiChatStreamRespVO> liveFlux =
+                aiStreamRedisService.subscribeFrom(taskId, lastStreamId);
+
+        // 3. 先回放历史，再续传实时
+        return Flux.concat(historyFlux, liveFlux);
     }
 
     public String getStatus(String taskId) {
