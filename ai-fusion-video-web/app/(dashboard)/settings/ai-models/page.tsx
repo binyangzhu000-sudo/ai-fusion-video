@@ -2038,7 +2038,7 @@ function FetchRemoteModelsDialog({
           </DialogDescription>
         </DialogHeader>
 
-        <div className="flex flex-col gap-3 min-h-0 overflow-y-auto px-1 -mx-1">
+        <div className="flex flex-col gap-3 min-h-0 overflow-y-auto px-1 pt-1 -mx-1">
           {/* 搜索框 + 模型类型选择 */}
           <div className="flex items-center gap-2 shrink-0">
             <div className="relative flex-1">
