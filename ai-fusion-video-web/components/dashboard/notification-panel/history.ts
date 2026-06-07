@@ -103,24 +103,62 @@ function updateLastSubTimelineReasoningDuration(
   }
 }
 
+function isPlaceholderToolName(name?: string): boolean {
+  return (
+    !name ||
+    name === "unknown_sub_agent" ||
+    name === "sub_agent" ||
+    name === "agent_spawn" ||
+    name === "agent_send" ||
+    name === "agent_list"
+  );
+}
+
 export function messagesToTimeline(messages: AgentMessage[]): TimelineItem[] {
   const timeline: TimelineItem[] = [];
   const toolIndexMap = new Map<string, number>();
 
+  const ensureParentTool = (
+    parentToolCallId: string,
+    fallbackName = "sub_agent"
+  ): Extract<TimelineItem, { type: "tool" }> => {
+    const parentIdx = toolIndexMap.get(parentToolCallId);
+    if (parentIdx !== undefined) {
+      const parentItem = timeline[parentIdx];
+      if (parentItem.type === "tool") {
+        if (fallbackName && isPlaceholderToolName(parentItem.name)) {
+          parentItem.name = fallbackName;
+        }
+        if (!parentItem.children) {
+          parentItem.children = [];
+        }
+        return parentItem;
+      }
+    }
+
+    const placeholder: Extract<TimelineItem, { type: "tool" }> = {
+      type: "tool",
+      id: parentToolCallId,
+      name: fallbackName,
+      arguments: "",
+      status: "calling",
+      children: [],
+    };
+    const idx = timeline.length;
+    timeline.push(placeholder);
+    toolIndexMap.set(parentToolCallId, idx);
+    return placeholder;
+  };
+
   const appendToParentChildren = (
     parentToolCallId: string,
-    updater: (children: SubTimelineItem[]) => void
+    updater: (children: SubTimelineItem[]) => void,
+    fallbackName = "sub_agent"
   ) => {
-    const parentIdx = toolIndexMap.get(parentToolCallId);
-    if (parentIdx === undefined) return;
-
-    const parentItem = timeline[parentIdx];
-    if (parentItem.type !== "tool") return;
-
+    const parentItem = ensureParentTool(parentToolCallId, fallbackName);
     if (!parentItem.children) {
       parentItem.children = [];
     }
-
     updater(parentItem.children);
   };
 
@@ -129,41 +167,63 @@ export function messagesToTimeline(messages: AgentMessage[]): TimelineItem[] {
       const toolCallId = msg.toolCallId || `hist-tool-${msg.id}`;
 
       if (msg.parentToolCallId) {
-        appendToParentChildren(msg.parentToolCallId, (children) => {
-          if (msg.toolStatus === "running") {
+        appendToParentChildren(
+          msg.parentToolCallId,
+          (children) => {
+            const existingChild = children.find(
+              (child) => child.type === "tool" && child.id === toolCallId
+            );
+            if (msg.toolStatus === "running") {
+              if (existingChild && existingChild.type === "tool") {
+                existingChild.name = msg.toolName || existingChild.name;
+                existingChild.arguments = msg.content || existingChild.arguments;
+                existingChild.status = "calling";
+                return;
+              }
+              children.push({
+                type: "tool",
+                id: toolCallId,
+                name: msg.toolName || "tool",
+                arguments: msg.content || "",
+                status: "calling",
+              });
+              return;
+            }
+
+            if (existingChild && existingChild.type === "tool") {
+              existingChild.name = msg.toolName || existingChild.name;
+              existingChild.status =
+                msg.toolStatus === "error" ? "error" : "done";
+              existingChild.result = msg.content;
+              return;
+            }
+
             children.push({
               type: "tool",
               id: toolCallId,
               name: msg.toolName || "tool",
-              arguments: msg.content || "",
-              status: "calling",
+              arguments: "",
+              status: msg.toolStatus === "error" ? "error" : "done",
+              result: msg.content,
             });
-            return;
-          }
-
-          const existingChild = children.find(
-            (child) => child.type === "tool" && child.id === toolCallId
-          );
-          if (existingChild && existingChild.type === "tool") {
-            existingChild.status =
-              msg.toolStatus === "error" ? "error" : "done";
-            existingChild.result = msg.content;
-            return;
-          }
-
-          children.push({
-            type: "tool",
-            id: toolCallId,
-            name: msg.toolName || "tool",
-            arguments: "",
-            status: msg.toolStatus === "error" ? "error" : "done",
-            result: msg.content,
-          });
-        });
+          },
+          "sub_agent"
+        );
         continue;
       }
 
       if (msg.toolStatus === "running") {
+        const existingIdx = toolIndexMap.get(toolCallId);
+        if (existingIdx !== undefined) {
+          const existingItem = timeline[existingIdx];
+          if (existingItem.type === "tool") {
+            existingItem.name = msg.toolName || existingItem.name;
+            existingItem.arguments = msg.content || existingItem.arguments;
+            existingItem.status = "calling";
+          }
+          continue;
+        }
+
         const idx = timeline.length;
         timeline.push({
           type: "tool",
@@ -180,6 +240,7 @@ export function messagesToTimeline(messages: AgentMessage[]): TimelineItem[] {
       if (existingIdx !== undefined) {
         const existingItem = timeline[existingIdx];
         if (existingItem.type === "tool") {
+          existingItem.name = msg.toolName || existingItem.name;
           existingItem.status =
             msg.toolStatus === "error" ? "error" : "done";
           existingItem.result = msg.content;
@@ -201,30 +262,34 @@ export function messagesToTimeline(messages: AgentMessage[]): TimelineItem[] {
     }
 
     if (msg.parentToolCallId) {
-      appendToParentChildren(msg.parentToolCallId, (children) => {
-        if (msg.reasoningContent) {
-          pushReasoningToSubTimeline(
-            children,
-            msg.reasoningContent,
-            msg.reasoningDurationMs
-          );
-        } else if (msg.reasoningDurationMs !== undefined) {
-          updateLastSubTimelineReasoningDuration(
-            children,
-            msg.reasoningDurationMs
-          );
-        }
-
-        if (msg.content) {
-          if (msg.reasoningDurationMs !== undefined) {
+      appendToParentChildren(
+        msg.parentToolCallId,
+        (children) => {
+          if (msg.reasoningContent) {
+            pushReasoningToSubTimeline(
+              children,
+              msg.reasoningContent,
+              msg.reasoningDurationMs
+            );
+          } else if (msg.reasoningDurationMs !== undefined) {
             updateLastSubTimelineReasoningDuration(
               children,
               msg.reasoningDurationMs
             );
           }
-          pushContentToSubTimeline(children, msg.content);
-        }
-      });
+
+          if (msg.content) {
+            if (msg.reasoningDurationMs !== undefined) {
+              updateLastSubTimelineReasoningDuration(
+                children,
+                msg.reasoningDurationMs
+              );
+            }
+            pushContentToSubTimeline(children, msg.content);
+          }
+        },
+        "sub_agent"
+      );
       continue;
     }
 

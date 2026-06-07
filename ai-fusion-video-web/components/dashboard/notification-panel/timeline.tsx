@@ -21,6 +21,7 @@ import type {
   TimelineItem,
 } from "@/lib/store/pipeline-store";
 import {
+  getSubAgentDisplayToolName,
   getToolDisplayName,
   isSubAgentTool,
 } from "./constants";
@@ -30,6 +31,41 @@ import {
   parseTaskContent,
   type TaskMediaLinkInfo,
 } from "./utils";
+
+function normalizeTimelineText(text?: string | null) {
+  return (text ?? "").replace(/\s+/g, "");
+}
+
+function isEquivalentTimelineText(left?: string | null, right?: string | null) {
+  const normalizedLeft = normalizeTimelineText(left);
+  const normalizedRight = normalizeTimelineText(right);
+  if (!normalizedLeft || !normalizedRight) {
+    return false;
+  }
+  return (
+    normalizedLeft === normalizedRight ||
+    normalizedLeft.includes(normalizedRight) ||
+    normalizedRight.includes(normalizedLeft)
+  );
+}
+
+function isRedundantAfterTool(
+  text: string,
+  previousTool: Extract<TimelineItem, { type: "tool" }>
+) {
+  const normalizedText = normalizeTimelineText(text);
+  if (!normalizedText) {
+    return false;
+  }
+  if (previousTool.result && normalizeTimelineText(previousTool.result).includes(normalizedText)) {
+    return true;
+  }
+  const childText = (previousTool.children ?? [])
+    .filter((child): child is Extract<SubTimelineItem, { type: "content" }> => child.type === "content")
+    .map((child) => child.text)
+    .join("");
+  return !!childText && normalizeTimelineText(childText).includes(normalizedText);
+}
 
 function TaskMediaLinks({ mediaLinks }: { mediaLinks: TaskMediaLinkInfo[] }) {
   if (mediaLinks.length === 0) {
@@ -178,6 +214,11 @@ function SubAgentCard({
   const [expanded, setExpanded] = useState(true);
   const children = item.children ?? [];
   const isRunning = item.status === "calling";
+  const displayToolName = getSubAgentDisplayToolName(
+    item.name,
+    item.agentName,
+    item.arguments
+  );
   const lastContentChild = [...children]
     .reverse()
     .find(
@@ -188,7 +229,7 @@ function SubAgentCard({
     );
   const renderedResult =
     !isRunning && item.result
-      ? lastContentChild?.text.trim() === item.result.trim()
+      ? isEquivalentTimelineText(lastContentChild?.text, item.result)
         ? null
         : item.result
       : null;
@@ -235,7 +276,12 @@ function SubAgentCard({
           <XCircle className="h-3.5 w-3.5 text-destructive shrink-0" />
         )}
         <Bot className="h-3.5 w-3.5 text-purple-400 shrink-0" />
-        <span className="font-medium text-xs">{getToolDisplayName(item.name)}</span>
+        <span className="font-medium text-xs">{getToolDisplayName(displayToolName)}</span>
+        {item.agentName && item.agentName !== displayToolName && (
+          <span className="text-[10px] text-muted-foreground/60 truncate max-w-[160px]">
+            {item.agentName}
+          </span>
+        )}
         {toolProgressLabel && (
           <span className="text-[10px] text-muted-foreground/60 ml-1">
             {toolProgressLabel}
@@ -381,7 +427,17 @@ export function MessageTimeline({
         }
 
         if (item.type === "tool") {
-          if (isSubAgentTool(item.name) || (item.children && item.children.length > 0)) {
+          const displayToolName = getSubAgentDisplayToolName(
+            item.name,
+            item.agentName,
+            item.arguments
+          );
+          if (
+            !!item.agentName ||
+            isSubAgentTool(item.name) ||
+            isSubAgentTool(displayToolName) ||
+            (item.children && item.children.length > 0)
+          ) {
             return <SubAgentCard key={`sub-agent-${item.id}`} item={item} />;
           }
           if (item.status === "calling") {
@@ -400,10 +456,8 @@ export function MessageTimeline({
         const prevItem = index > 0 ? timeline[index - 1] : null;
         if (
           prevItem?.type === "tool" &&
-          (isSubAgentTool(prevItem.name) ||
-            (prevItem.children && prevItem.children.length > 0)) &&
-          prevItem.result &&
-          item.text.trim() === prevItem.result.trim()
+          (prevItem.children?.length || prevItem.result) &&
+          isRedundantAfterTool(item.text, prevItem)
         ) {
           return null;
         }

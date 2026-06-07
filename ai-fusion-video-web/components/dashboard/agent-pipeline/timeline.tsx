@@ -3,7 +3,6 @@
 import { useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import {
-  Ban,
   Bot,
   CheckCircle2,
   ChevronDown,
@@ -16,42 +15,122 @@ import { StreamMarkdown } from "@/components/dashboard/stream-markdown";
 import { StreamThink } from "@/components/dashboard/stream-think";
 import { cn } from "@/lib/utils";
 import {
+  getSubAgentDisplayToolName,
   getToolDisplayName,
   isSubAgentTool,
 } from "../shared/ai-task-display";
 import { ToolResultDisplay } from "./results";
 import type { SubTimelineItem, TimelineItem } from "./types";
 
+function normalizeTimelineText(text?: string | null) {
+  return (text ?? "").replace(/\s+/g, "");
+}
+
+function isEquivalentTimelineText(left?: string | null, right?: string | null) {
+  const normalizedLeft = normalizeTimelineText(left);
+  const normalizedRight = normalizeTimelineText(right);
+  if (!normalizedLeft || !normalizedRight) {
+    return false;
+  }
+  return (
+    normalizedLeft === normalizedRight ||
+    normalizedLeft.includes(normalizedRight) ||
+    normalizedRight.includes(normalizedLeft)
+  );
+}
+
+function isRedundantAfterTool(
+  text: string,
+  previousTool: Extract<TimelineItem, { type: "tool" }>
+) {
+  const normalizedText = normalizeTimelineText(text);
+  if (!normalizedText) {
+    return false;
+  }
+  if (previousTool.result && normalizeTimelineText(previousTool.result).includes(normalizedText)) {
+    return true;
+  }
+  const childText = (previousTool.children ?? [])
+    .filter((child): child is Extract<SubTimelineItem, { type: "content" }> => child.type === "content")
+    .map((child) => child.text)
+    .join("");
+  return !!childText && normalizeTimelineText(childText).includes(normalizedText);
+}
+
 function SubTimelineToolItem({
   child,
 }: {
   child: Extract<SubTimelineItem, { type: "tool" }>;
 }) {
+  const [expanded, setExpanded] = useState(child.status !== "calling");
+  const hasResult =
+    (child.status === "done" || child.status === "error") && !!child.result;
+
   return (
     <div
       className={cn(
-        "rounded-lg border text-xs px-3 py-2 flex items-center gap-2",
+        "rounded-lg border text-xs overflow-hidden",
         child.status === "calling" && "border-blue-500/20 bg-blue-500/5",
         child.status === "done" && "border-green-500/20 bg-green-500/5",
         child.status === "error" && "border-destructive/20 bg-destructive/5"
       )}
     >
-      {child.status === "calling" ? (
-        <Loader2 className="h-3 w-3 animate-spin text-blue-400 shrink-0" />
-      ) : child.status === "done" ? (
-        <CheckCircle2 className="h-3 w-3 text-green-400 shrink-0" />
-      ) : (
-        <XCircle className="h-3 w-3 text-destructive shrink-0" />
-      )}
-      {isSubAgentTool(child.name) ? (
-        <Bot className="h-3 w-3 text-purple-400 shrink-0" />
-      ) : (
-        <Wrench className="h-3 w-3 text-muted-foreground shrink-0" />
-      )}
-      <span className="font-medium">{getToolDisplayName(child.name)}</span>
-      <span className="ml-auto text-muted-foreground/60">
-        {child.status === "calling" ? "执行中..." : child.status === "done" ? "✓" : "✗"}
-      </span>
+      <div
+        className={cn(
+          "flex items-center gap-2 px-3 py-2",
+          hasResult &&
+            "cursor-pointer hover:bg-black/5 dark:hover:bg-white/5 transition-colors"
+        )}
+        onClick={() => hasResult && setExpanded(!expanded)}
+      >
+        {child.status === "calling" ? (
+          <Loader2 className="h-3 w-3 animate-spin text-blue-400 shrink-0" />
+        ) : child.status === "done" ? (
+          <CheckCircle2 className="h-3 w-3 text-green-400 shrink-0" />
+        ) : (
+          <XCircle className="h-3 w-3 text-destructive shrink-0" />
+        )}
+        {isSubAgentTool(child.name) ? (
+          <Bot className="h-3 w-3 text-purple-400 shrink-0" />
+        ) : (
+          <Wrench className="h-3 w-3 text-muted-foreground shrink-0" />
+        )}
+        <span className="font-medium min-w-0 truncate">
+          {getToolDisplayName(child.name)}
+        </span>
+        <span className="ml-auto flex items-center gap-1 text-muted-foreground/60 shrink-0">
+          {child.status === "calling" ? "执行中..." : child.status === "done" ? "完成" : "失败"}
+          {hasResult &&
+            (expanded ? (
+              <ChevronDown className="h-3 w-3" />
+            ) : (
+              <ChevronRight className="h-3 w-3" />
+            ))}
+        </span>
+      </div>
+
+      <AnimatePresence initial={false}>
+        {hasResult && expanded && (
+          <motion.div
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: "auto", opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            transition={{ duration: 0.2 }}
+            className="overflow-hidden"
+          >
+            <div
+              className={cn(
+                "border-t px-3 py-2",
+                child.status === "error"
+                  ? "border-destructive/10"
+                  : "border-green-500/10"
+              )}
+            >
+              <ToolResultDisplay toolName={child.name} result={child.result!} />
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }
@@ -65,10 +144,32 @@ function ToolTimelineItem({
   isExpanded: boolean;
   onToggle: () => void;
 }) {
+  const displayToolName = getSubAgentDisplayToolName(
+    item.name,
+    item.agentName,
+    item.arguments
+  );
+  const isSubAgentLike =
+    !!item.agentName ||
+    isSubAgentTool(item.name) ||
+    isSubAgentTool(displayToolName) ||
+    !!item.children?.length;
   const hasResult =
     (item.status === "done" || item.status === "error") && item.result;
   const hasChildren = !!item.children?.length;
-  const canExpand = hasResult || hasChildren;
+  const lastContentChild = [...(item.children ?? [])]
+    .reverse()
+    .find(
+      (
+        child
+      ): child is Extract<SubTimelineItem, { type: "content" }> =>
+        child.type === "content"
+    );
+  const renderedResult =
+    hasResult && isEquivalentTimelineText(item.result, lastContentChild?.text)
+      ? null
+      : item.result;
+  const canExpand = !!renderedResult || hasChildren;
 
   return (
     <motion.div
@@ -76,7 +177,10 @@ function ToolTimelineItem({
       animate={{ opacity: 1, x: 0 }}
       className={cn(
         "rounded-xl text-sm border overflow-hidden",
-        item.status === "calling" && "border-blue-500/20 bg-blue-500/5",
+        item.status === "calling" &&
+          (isSubAgentLike
+            ? "border-purple-500/20 bg-purple-500/5"
+            : "border-blue-500/20 bg-blue-500/5"),
         item.status === "done" && "border-green-500/20 bg-green-500/5",
         item.status === "error" && "border-destructive/20 bg-destructive/5"
       )}
@@ -89,7 +193,12 @@ function ToolTimelineItem({
         onClick={() => canExpand && onToggle()}
       >
         {item.status === "calling" ? (
-          <Loader2 className="h-3.5 w-3.5 animate-spin text-blue-400 shrink-0" />
+          <Loader2
+            className={cn(
+              "h-3.5 w-3.5 animate-spin shrink-0",
+              isSubAgentLike ? "text-purple-400" : "text-blue-400"
+            )}
+          />
         ) : item.status === "done" ? (
           <CheckCircle2 className="h-3.5 w-3.5 text-green-400 shrink-0" />
         ) : (
@@ -100,9 +209,25 @@ function ToolTimelineItem({
         ) : (
           <Wrench className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
         )}
-        <span className="font-medium text-xs">{getToolDisplayName(item.name)}</span>
+        <span className="font-medium text-xs min-w-0 truncate">
+          {getToolDisplayName(displayToolName)}
+        </span>
+        {item.agentName && item.agentName !== displayToolName && (
+          <span className="text-[10px] text-muted-foreground/60 truncate max-w-[160px]">
+            {item.agentName}
+          </span>
+        )}
         {item.status === "calling" && (
-          <span className="text-xs text-muted-foreground ml-auto">执行中...</span>
+          <span
+            className={cn(
+              "text-xs ml-auto shrink-0",
+              isSubAgentLike
+                ? "text-purple-400/80"
+                : "text-muted-foreground"
+            )}
+          >
+            {isSubAgentLike ? "运行中..." : "执行中..."}
+          </span>
         )}
         {item.status === "done" && (
           <span className="flex items-center gap-1.5 text-xs text-green-400/80 ml-auto">
@@ -129,7 +254,7 @@ function ToolTimelineItem({
       </div>
 
       <AnimatePresence>
-        {isExpanded && (hasResult || hasChildren) && (
+        {isExpanded && (renderedResult || hasChildren) && (
           <motion.div
             initial={{ height: 0, opacity: 0 }}
             animate={{ height: "auto", opacity: 1 }}
@@ -190,8 +315,8 @@ function ToolTimelineItem({
                   })}
                 </div>
               )}
-              {hasResult && (
-                <ToolResultDisplay toolName={item.name} result={item.result!} />
+              {renderedResult && (
+                <ToolResultDisplay toolName={displayToolName} result={renderedResult} />
               )}
             </div>
           </motion.div>
@@ -209,6 +334,9 @@ export function AgentPipelineTimeline({
   isActive: boolean;
 }) {
   const [expandedTools, setExpandedTools] = useState<Set<string>>(new Set());
+  const [collapsedSubAgentTools, setCollapsedSubAgentTools] = useState<Set<string>>(
+    new Set()
+  );
   const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -246,22 +374,46 @@ export function AgentPipelineTimeline({
         }
 
         if (item.type === "tool") {
-          const isExpanded = expandedTools.has(item.id);
+          const displayToolName = getSubAgentDisplayToolName(
+            item.name,
+            item.agentName,
+            item.arguments
+          );
+          const isSubAgentLike =
+            !!item.agentName ||
+            isSubAgentTool(item.name) ||
+            isSubAgentTool(displayToolName) ||
+            !!item.children?.length;
+          const isExpanded = isSubAgentLike
+            ? !collapsedSubAgentTools.has(item.id)
+            : expandedTools.has(item.id);
           return (
             <ToolTimelineItem
               key={`tool-${item.id}`}
               item={item}
               isExpanded={isExpanded}
               onToggle={() => {
-                setExpandedTools((prev) => {
-                  const next = new Set(prev);
-                  if (next.has(item.id)) {
-                    next.delete(item.id);
-                  } else {
-                    next.add(item.id);
-                  }
-                  return next;
-                });
+                if (isSubAgentLike) {
+                  setCollapsedSubAgentTools((prev) => {
+                    const next = new Set(prev);
+                    if (next.has(item.id)) {
+                      next.delete(item.id);
+                    } else {
+                      next.add(item.id);
+                    }
+                    return next;
+                  });
+                } else {
+                  setExpandedTools((prev) => {
+                    const next = new Set(prev);
+                    if (next.has(item.id)) {
+                      next.delete(item.id);
+                    } else {
+                      next.add(item.id);
+                    }
+                    return next;
+                  });
+                }
               }}
             />
           );
@@ -270,10 +422,8 @@ export function AgentPipelineTimeline({
         const prevItem = index > 0 ? timeline[index - 1] : null;
         if (
           prevItem?.type === "tool" &&
-          prevItem.children &&
-          prevItem.children.length > 0 &&
-          prevItem.result &&
-          item.text.trim() === prevItem.result.trim()
+          (prevItem.children?.length || prevItem.result) &&
+          isRedundantAfterTool(item.text, prevItem)
         ) {
           return null;
         }

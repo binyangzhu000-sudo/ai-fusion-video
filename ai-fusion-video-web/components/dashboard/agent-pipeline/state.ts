@@ -90,25 +90,109 @@ function updateLastTimelineReasoningDuration(
 function updateToolStatus(
   timeline: TimelineItem[],
   toolCallId: string,
-  status: "calling" | "done" | "error"
+  status: "calling" | "done" | "error",
+  options?: {
+    name?: string;
+    result?: string;
+    agentName?: string;
+  }
 ): TimelineItem[] {
-  return timeline.map((item) =>
-    item.type === "tool" && item.id === toolCallId
-      ? { ...item, status }
-      : item
+  let found = false;
+  const updated = timeline.map((item) => {
+    if (item.type !== "tool" || item.id !== toolCallId) {
+      return item;
+    }
+    found = true;
+    return {
+      ...item,
+      status,
+      ...(options?.result !== undefined ? { result: options.result } : {}),
+      ...(options?.name && isPlaceholderToolName(item.name)
+        ? { name: options.name }
+        : {}),
+      ...(options?.agentName && !item.agentName
+        ? { agentName: options.agentName }
+        : {}),
+    };
+  });
+
+  if (found) {
+    return updated;
+  }
+
+  return [
+    ...updated,
+    {
+      type: "tool",
+      id: toolCallId,
+      name: options?.name || "sub_agent",
+      arguments: "",
+      status,
+      result: options?.result,
+      agentName: options?.agentName,
+      children: [],
+    },
+  ];
+}
+
+function isPlaceholderToolName(name?: string): boolean {
+  return (
+    !name ||
+    name === "unknown_sub_agent" ||
+    name === "sub_agent" ||
+    name === "agent_spawn" ||
+    name === "agent_send" ||
+    name === "agent_list"
   );
+}
+
+function subAgentParentName(event: AiChatStreamEvent): string {
+  return event.agentName || event.toolName || "sub_agent";
 }
 
 function appendToToolChildren(
   timeline: TimelineItem[],
   parentToolCallId: string,
-  updater: (children: SubTimelineItem[]) => SubTimelineItem[]
+  updater: (children: SubTimelineItem[]) => SubTimelineItem[],
+  options?: {
+    placeholderName?: string;
+    agentName?: string;
+  }
 ): TimelineItem[] {
-  return timeline.map((item) =>
-    item.type === "tool" && item.id === parentToolCallId
-      ? { ...item, children: updater(item.children ?? []) }
-      : item
-  );
+  let found = false;
+  const updated = timeline.map((item) => {
+    if (item.type !== "tool" || item.id !== parentToolCallId) {
+      return item;
+    }
+    found = true;
+    return {
+      ...item,
+      ...(options?.placeholderName && isPlaceholderToolName(item.name)
+        ? { name: options.placeholderName }
+        : {}),
+      ...(options?.agentName && !item.agentName
+        ? { agentName: options.agentName }
+        : {}),
+      children: updater(item.children ?? []),
+    };
+  });
+
+  if (found) {
+    return updated;
+  }
+
+  return [
+    ...updated,
+    {
+      type: "tool",
+      id: parentToolCallId,
+      name: options?.placeholderName || "sub_agent",
+      arguments: "",
+      status: "calling",
+      agentName: options?.agentName,
+      children: updater([]),
+    },
+  ];
 }
 
 function appendContentToSubTimeline(
@@ -169,7 +253,11 @@ export function reducePipelineEvent(
             next.timeline,
             event.parentToolCallId!,
             (children) =>
-              appendReasoningToSubTimeline(children, event.reasoningContent!)
+              appendReasoningToSubTimeline(children, event.reasoningContent!),
+            {
+              placeholderName: subAgentParentName(event),
+              agentName: event.agentName,
+            }
           );
         } else {
           next.status = "reasoning";
@@ -201,7 +289,11 @@ export function reducePipelineEvent(
                 children,
                 event.content!,
                 event.reasoningDurationMs
-              )
+              ),
+            {
+              placeholderName: subAgentParentName(event),
+              agentName: event.agentName,
+            }
           );
         } else {
           next.timeline = appendContentToTimeline(next.timeline, event.content);
@@ -218,12 +310,20 @@ export function reducePipelineEvent(
               next.timeline,
               event.parentToolCallId!,
               (children) => {
-                if (
-                  children.some(
-                    (child) => child.type === "tool" && child.id === toolCall.id
-                  )
-                ) {
-                  return children;
+                const existing = children.find(
+                  (child) => child.type === "tool" && child.id === toolCall.id
+                );
+                if (existing?.type === "tool") {
+                  return children.map((child) =>
+                    child.type === "tool" && child.id === toolCall.id
+                      ? {
+                          ...child,
+                          name: toolCall.name || child.name,
+                          arguments: toolCall.arguments || child.arguments,
+                          status: "calling",
+                        }
+                      : child
+                  );
                 }
                 return [
                   ...children,
@@ -235,6 +335,10 @@ export function reducePipelineEvent(
                     status: "calling",
                   },
                 ];
+              },
+              {
+                placeholderName: subAgentParentName(event),
+                agentName: event.agentName,
               }
             );
           } else if (
@@ -250,6 +354,18 @@ export function reducePipelineEvent(
               status: "calling",
               agentName: event.agentName,
             });
+          } else {
+            next.timeline = next.timeline.map((item) =>
+              item.type === "tool" && item.id === toolCall.id
+                ? {
+                    ...item,
+                    name: toolCall.name || item.name,
+                    arguments: toolCall.arguments || item.arguments,
+                    status: "calling",
+                    agentName: item.agentName || event.agentName,
+                  }
+                : item
+            );
           }
         }
       }
@@ -257,23 +373,56 @@ export function reducePipelineEvent(
 
     case "TOOL_FINISHED":
       if (event.toolCallId) {
-        const toolItemStatus = event.toolStatus === "error" ? "error" : "done";
+        const toolItemStatus: "done" | "error" =
+          event.toolStatus === "error" ? "error" : "done";
         if (isSubAgent) {
           next.timeline = appendToToolChildren(
             next.timeline,
             event.parentToolCallId!,
-            (children) =>
-              children.map((child) =>
-                child.type === "tool" && child.id === event.toolCallId
-                  ? { ...child, status: toolItemStatus, result: event.toolResult }
-                  : child
-              )
+            (children) => {
+              let found = false;
+              const updated = children.map((child) => {
+                if (child.type !== "tool" || child.id !== event.toolCallId) {
+                  return child;
+                }
+                found = true;
+                return {
+                  ...child,
+                  name: event.toolName || child.name,
+                  status: toolItemStatus,
+                  result: event.toolResult,
+                };
+              });
+              if (found) {
+                return updated;
+              }
+              return [
+                ...updated,
+                {
+                  type: "tool",
+                  id: event.toolCallId!,
+                  name: event.toolName || "tool",
+                  arguments: "",
+                  status: toolItemStatus,
+                  result: event.toolResult,
+                },
+              ];
+            },
+            {
+              placeholderName: subAgentParentName(event),
+              agentName: event.agentName,
+            }
           );
         } else {
-          next.timeline = next.timeline.map((item) =>
-            item.type === "tool" && item.id === event.toolCallId
-              ? { ...item, status: toolItemStatus, result: event.toolResult }
-              : item
+          next.timeline = updateToolStatus(
+            next.timeline,
+            event.toolCallId,
+            toolItemStatus,
+            {
+              name: event.toolName,
+              result: event.toolResult,
+              agentName: event.agentName,
+            }
           );
         }
       }
@@ -284,7 +433,11 @@ export function reducePipelineEvent(
         next.timeline = updateToolStatus(
           next.timeline,
           event.parentToolCallId!,
-          "done"
+          "done",
+          {
+            name: subAgentParentName(event),
+            agentName: event.agentName,
+          }
         );
       }
       return next;
@@ -301,7 +454,11 @@ export function reducePipelineEvent(
         next.timeline = updateToolStatus(
           next.timeline,
           event.parentToolCallId!,
-          "error"
+          "error",
+          {
+            name: subAgentParentName(event),
+            agentName: event.agentName,
+          }
         );
         next.timeline = appendToToolChildren(
           next.timeline,
@@ -312,7 +469,11 @@ export function reducePipelineEvent(
               type: "content",
               text: `❌ ${event.agentName || "子Agent"} 出错: ${event.error || "未知错误"}`,
             },
-          ]
+          ],
+          {
+            placeholderName: subAgentParentName(event),
+            agentName: event.agentName,
+          }
         );
       } else {
         next.status = "error";

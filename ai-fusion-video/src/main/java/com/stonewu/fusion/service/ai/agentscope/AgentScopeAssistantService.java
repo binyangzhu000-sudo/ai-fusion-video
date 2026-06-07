@@ -16,10 +16,15 @@ import com.stonewu.fusion.service.ai.AgentMessageService;
 import com.stonewu.fusion.service.ai.AiAgentService;
 import com.stonewu.fusion.service.ai.AiModelService;
 import com.stonewu.fusion.service.ai.AiStreamRedisService;
+import com.stonewu.fusion.service.ai.AiStreamRedisService.StreamEventAccumulator;
+import com.stonewu.fusion.service.ai.AiStreamRedisService.StreamEventAccumulator.AccumulatedEvent;
 import com.stonewu.fusion.service.ai.AiToolConfigService;
 import com.stonewu.fusion.service.ai.ToolExecutionContext;
 import com.stonewu.fusion.service.ai.ToolExecutor;
+import io.agentscope.core.agent.Event;
+import io.agentscope.core.agent.EventType;
 import io.agentscope.core.agent.RuntimeContext;
+import io.agentscope.core.agent.StreamOptions;
 import io.agentscope.core.message.Msg;
 import io.agentscope.core.message.UserMessage;
 import io.agentscope.core.model.ExecutionConfig;
@@ -45,10 +50,8 @@ import org.springframework.stereotype.Service;
 import reactor.core.Disposable;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.SignalType;
-import reactor.core.scheduler.Schedulers;
-import com.stonewu.fusion.service.ai.AiStreamRedisService.StreamEventAccumulator;
-import com.stonewu.fusion.service.ai.AiStreamRedisService.StreamEventAccumulator.AccumulatedEvent;
 import reactor.core.publisher.Sinks;
+import reactor.core.scheduler.Schedulers;
 
 import java.nio.file.Path;
 import java.time.Duration;
@@ -67,10 +70,13 @@ import java.util.concurrent.atomic.AtomicReference;
  * <p>
  * 基于 AgentScope Java HarnessAgent 实现流式对话，支持：
  * - 父/子 Agent（Multi-Agent）架构
- * - 通过 AgentScope 2.x AgentEvent 事件流实现流式事件推送
+ * - 临时通过 AgentScope 旧 stream() / Flux<Event> 事件流实现流式事件推送
  * - 子 Agent 事件由工具适配器桥接，并通过 parentToolCallId 归属到父工具调用
  * - 工具和子 Agent 的并行调用（Toolkit.parallel=true）
  * - Redis Stream 解耦，支持 SSE 断线重连
+ * <p>
+ * 注意：AgentScope 2.0-RC1 的 streamEvents() 当前不会转发子 Agent 来源事件；
+ * 本服务暂时回退到旧 stream()，待 v2 完整支持子来源 streamEvents() 后再迁回。
  */
 @Service
 @RequiredArgsConstructor
@@ -126,7 +132,7 @@ public class AgentScopeAssistantService {
 
     /** 保存后台 Redis 事件流的 Disposable */
     private final ConcurrentHashMap<String, Disposable> activeSubscriptions = new ConcurrentHashMap<>();
-    /** 保存 agent.streamEvents() 的 Disposable，cancelStream 时真正取消 Agent 执行 */
+    /** 保存 AgentScope 底层流的 Disposable，cancelStream 时真正取消主/子 Agent 执行 */
     private final ConcurrentHashMap<String, Disposable> agentCallSubscriptions = new ConcurrentHashMap<>();
     /** 保存当前对话的 AgentScope 事件桥，供 cancelStream 时中断主/子 Agent */
     private final ConcurrentHashMap<String, AgentScopeEventBridge> activeEventBridges = new ConcurrentHashMap<>();
@@ -198,7 +204,8 @@ public class AgentScopeAssistantService {
             LocalFilesystemSpec filesystemSpec = new LocalFilesystemSpec()
                     .project(workspacePath)
                     .mode(LocalFsMode.SANDBOXED);
-            Toolkit toolkit = buildToolkit(reqVO, toolExecContext, cancellationToken, workspacePath, filesystemSpec);
+            Toolkit toolkit = buildToolkit(
+                    reqVO, subAgentTools, toolExecContext, cancellationToken, workspacePath, filesystemSpec);
             SimpleSessionKey mainSessionKey = agentSessionKey(conversationId, mainAgentName);
             RuntimeContext runtimeContext = RuntimeContext.builder()
                     .userId(userId != null ? userId.toString() : null)
@@ -360,8 +367,8 @@ public class AgentScopeAssistantService {
 
             activeSubscriptions.put(conversationId, redisSubscription);
 
-            // 15. 后台异步调用 AgentScope 2.x 事件流
-            Disposable agentDisposable = agent.streamEvents(userMsg, runtimeContext)
+            // 15. 后台异步调用 AgentScope 旧 stream() 事件流
+            Disposable agentDisposable = streamWithLegacySubAgentEvents(agent, userMsg, runtimeContext)
                     .doOnNext(event -> {
                         if (cancellationToken.isCancelled()) {
                             agent.interrupt();
@@ -440,6 +447,35 @@ public class AgentScopeAssistantService {
     }
 
     /**
+     * 临时使用 AgentScope 旧 {@code stream()} API 获取 {@code Flux<Event>}。
+     * <p>
+     * AgentScope 2.0-RC1 的 {@code streamEvents()} 已经是更理想的 v2 事件接口，
+     * 但目前不会把子 Agent 的来源事件透传给父 Agent 流。Harness 子 Agent 文档里也提示：
+     * 需要实时观察子 Agent 事件时，现阶段应继续使用旧 {@code stream()} / {@code Flux<Event>}。
+     * 因此这里显式打开 {@link EventType#ALL}、增量 chunk、reasoning/tool/result 输出，
+     * 让 {@link AgentScopeEventBridge} 能把父/子 Agent 的 {@link Event} 转成现有 SSE wire shape。
+     * <p>
+     * 迁移计划：等 AgentScope v2 完整支持子来源 {@code streamEvents()} 后，把调用点切回
+     * {@code agent.streamEvents(userMsg, runtimeContext)}，并删除 {@link AgentScopeEventBridge}
+     * 中旧 {@link Event} 转换、子 Agent 合成父工具节点和相关关联表逻辑。
+     */
+    @SuppressWarnings({"deprecation", "removal"})
+    private Flux<Event> streamWithLegacySubAgentEvents(HarnessAgent agent,
+            Msg userMsg,
+            RuntimeContext runtimeContext) {
+        StreamOptions legacyStreamOptions = StreamOptions.builder()
+                .eventTypes(EventType.ALL)
+                .incremental(true)
+                .includeReasoningChunk(true)
+                .includeReasoningResult(true)
+                .includeActingChunk(true)
+                .includeSummaryChunk(true)
+                .includeSummaryResult(true)
+                .build();
+        return agent.stream(List.of(userMsg), legacyStreamOptions, runtimeContext);
+    }
+
+    /**
      * 取消对话
      */
     public void cancelStream(String conversationId) {
@@ -455,7 +491,7 @@ public class AgentScopeAssistantService {
             eventBridge.interruptTrackedAgents();
         }
 
-        // 1. 取消 agent.streamEvents() 的底层执行（LLM 调用 + 工具调用）
+        // 1. 取消 AgentScope 底层流的执行（LLM 调用 + 工具调用）
         Disposable agentSub = agentCallSubscriptions.remove(conversationId);
         if (agentSub != null && !agentSub.isDisposed()) {
             agentSub.dispose();
@@ -736,34 +772,12 @@ public class AgentScopeAssistantService {
      * 构建 Toolkit（含普通工具和子 Agent 工具）
      */
     private Toolkit buildToolkit(AiChatReqVO reqVO,
+            List<AiAgentDefinition.SubAgentToolDef> subAgentTools,
             ToolExecutionContext toolExecContext,
             AgentCancellationToken cancellationToken,
             Path workspacePath,
             LocalFilesystemSpec filesystemSpec) {
-        String agentType = reqVO.getAgentType();
-
-        // 检查是否启用工具
-        boolean businessToolsEnabled = true;
-        if (StrUtil.isNotBlank(agentType)) {
-            AiAgentDefinition agentDef = aiAgentService.getByType(agentType);
-            if (agentDef != null && !Integer.valueOf(1).equals(agentDef.getEnableTools())) {
-                businessToolsEnabled = false;
-            }
-        }
-
-        // 获取工具列表
-        List<ToolExecutor> enabledTools =
-                businessToolsEnabled ? aiToolConfigService.getEnabledToolsByAgent(agentType) : List.of();
-
-        // 与前端 enabledTools 取交集
-        List<ToolExecutor> filteredTools = new ArrayList<>();
-        for (ToolExecutor tool : enabledTools) {
-            if (CollUtil.isNotEmpty(reqVO.getEnabledTools())
-                    && !reqVO.getEnabledTools().contains(tool.getToolName())) {
-                continue;
-            }
-            filteredTools.add(tool);
-        }
+        List<ToolExecutor> filteredTools = resolveToolkitBusinessTools(reqVO, subAgentTools);
 
         boolean includeWorkspaceTools =
                 harnessProperties.isReadOnlyWorkspaceToolsEnabled() && workspacePath != null && filesystemSpec != null;
@@ -805,6 +819,53 @@ public class AgentScopeAssistantService {
         return toolkit;
     }
 
+    List<ToolExecutor> resolveToolkitBusinessTools(
+            AiChatReqVO reqVO,
+            List<AiAgentDefinition.SubAgentToolDef> subAgentTools) {
+        String agentType = reqVO.getAgentType();
+        boolean businessToolsEnabled = true;
+        if (StrUtil.isNotBlank(agentType)) {
+            AiAgentDefinition agentDef = aiAgentService.getByType(agentType);
+            if (agentDef != null && !Integer.valueOf(1).equals(agentDef.getEnableTools())) {
+                businessToolsEnabled = false;
+            }
+        }
+        if (!businessToolsEnabled) {
+            return List.of();
+        }
+
+        Map<String, ToolExecutor> toolkitTools = new LinkedHashMap<>();
+        List<ToolExecutor> enabledTools = aiToolConfigService.getEnabledToolsByAgent(agentType);
+
+        // 父 Agent 的普通业务工具继续与前端 enabledTools 取交集。
+        for (ToolExecutor tool : enabledTools) {
+            if (CollUtil.isNotEmpty(reqVO.getEnabledTools())
+                    && !reqVO.getEnabledTools().contains(tool.getToolName())) {
+                continue;
+            }
+            toolkitTools.putIfAbsent(tool.getToolName(), tool);
+        }
+
+        // AgentScope Harness 子 Agent 共享父 Agent 的 Toolkit；子 Agent spec 里的 tools
+        // 只是白名单声明，运行时仍要求工具已经注册在这个 Toolkit 中。这里把当前允许的
+        // agent_spawn/agent_send 目标所引用的 refAgentType 工具也注册进去，否则子 Agent
+        // 会在执行时出现 "Tool not found: generate_image" 这类错误。
+        boolean readOnlySubagentToolsOnly = shouldUseReadOnlySubagentTools(reqVO);
+        for (AiAgentDefinition.SubAgentToolDef subAgentTool : CollUtil.emptyIfNull(subAgentTools)) {
+            if (subAgentTool == null || StrUtil.isBlank(subAgentTool.getRefAgentType())) {
+                continue;
+            }
+            for (ToolExecutor tool : aiToolConfigService.getEnabledToolsByAgent(subAgentTool.getRefAgentType())) {
+                if (readOnlySubagentToolsOnly && !tool.isReadOnly()) {
+                    continue;
+                }
+                toolkitTools.putIfAbsent(tool.getToolName(), tool);
+            }
+        }
+
+        return new ArrayList<>(toolkitTools.values());
+    }
+
     private Set<String> readOnlyWorkspaceRootPrefixes() {
         Set<String> prefixes = new LinkedHashSet<>();
         AgentScopeHarnessProperties.ToolResultEviction eviction = harnessProperties.getToolResultEviction();
@@ -834,6 +895,14 @@ public class AgentScopeAssistantService {
         return subAgentTools.stream()
                 .filter(subTool -> reqVO.getEnabledTools().contains(subTool.getToolName()))
                 .toList();
+    }
+
+    private boolean shouldUseReadOnlySubagentTools(AiChatReqVO reqVO) {
+        if (!harnessProperties.isPlanModeEnabled() || !harnessProperties.isPlanModeReadOnlySubagentToolsOnly()) {
+            return false;
+        }
+        String mode = reqVO != null ? reqVO.getHarnessMode() : null;
+        return "PLAN".equals(StrUtil.blankToDefault(mode, "").trim().toUpperCase(Locale.ROOT));
     }
 
     private SkillManageConfig buildSkillManageConfig() {

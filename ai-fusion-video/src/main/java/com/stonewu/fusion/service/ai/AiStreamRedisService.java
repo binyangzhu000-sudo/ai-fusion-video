@@ -310,7 +310,7 @@ public class AiStreamRedisService {
     /**
      * 将连续的 REASONING/CONTENT token 事件合并为单条完整文本记录。
      * <p>
-     * 合并规则：连续且 (outputType, parentToolCallId) 相同的 REASONING/CONTENT 事件
+     * 合并规则：连续且 (outputType, parentToolCallId, agentName) 相同的 REASONING/CONTENT 事件
      * 会被累积。当类型切换或遇到离散事件（TOOL_CALL/TOOL_FINISHED/DONE/ERROR）时，
      * 先 flush 已积累的文本为一条合并记录，然后透传离散事件。
      * <p>
@@ -335,6 +335,7 @@ public class AiStreamRedisService {
         private AiChatStreamRespVO currentTemplate;
         private String currentOutputType;
         private String currentParentToolCallId;
+        private String currentAgentName;
         private final StringBuilder textBuffer = new StringBuilder();
         private String lastStreamId;
         // 记录第一个 REASONING 事件的 startTime
@@ -356,12 +357,16 @@ public class AiStreamRedisService {
         public List<AccumulatedEvent> accumulate(AiChatStreamRespVO event, String streamId) {
             String outputType = event.getOutputType();
             String parentToolCallId = event.getParentToolCallId();
+            String agentName = event.getAgentName();
             List<AccumulatedEvent> result = new ArrayList<>(2);
 
             if (isMergeableType(outputType)) {
-                // REASONING 或 CONTENT：检查是否与当前累积的类型/上下文相同
+                // REASONING 或 CONTENT：检查是否与当前累积的类型/父工具/Agent 来源相同。
+                // 子 Agent 可以并发挂在同一个 parentToolCallId 下，agentName 必须参与 key，
+                // 否则断线重连 replay 时不同子 Agent 的 token 会被错误拼接。
                 boolean sameContext = outputType.equals(currentOutputType)
-                        && StrUtil.equals(parentToolCallId, currentParentToolCallId);
+                        && StrUtil.equals(parentToolCallId, currentParentToolCallId)
+                        && StrUtil.equals(agentName, currentAgentName);
 
                 if (sameContext) {
                     // 继续累积
@@ -384,7 +389,7 @@ public class AiStreamRedisService {
                         result.add(flushed);
                     }
                     // 开始新的累积
-                    startNewAccumulation(event, outputType, parentToolCallId, streamId);
+                    startNewAccumulation(event, outputType, parentToolCallId, agentName, streamId);
                 }
             } else {
                 // 离散事件（TOOL_CALL, TOOL_FINISHED, DONE, ERROR, CANCELLED 等）
@@ -418,7 +423,7 @@ public class AiStreamRedisService {
                     .setConversationId(conversationId)
                     .setOutputType(currentOutputType)
                     .setParentToolCallId(currentParentToolCallId)
-                    .setAgentName(currentTemplate.getAgentName());
+                    .setAgentName(currentAgentName);
 
             if ("REASONING".equals(currentOutputType)) {
                 merged.setReasoningContent(textBuffer.toString());
@@ -438,10 +443,11 @@ public class AiStreamRedisService {
         }
 
         private void startNewAccumulation(AiChatStreamRespVO event, String outputType,
-                String parentToolCallId, String streamId) {
+                String parentToolCallId, String agentName, String streamId) {
             this.currentTemplate = event;
             this.currentOutputType = outputType;
             this.currentParentToolCallId = parentToolCallId;
+            this.currentAgentName = agentName;
             this.lastStreamId = streamId;
             this.reasoningStartTime = null;
             this.reasoningDurationMs = null;
@@ -472,6 +478,7 @@ public class AiStreamRedisService {
             currentTemplate = null;
             currentOutputType = null;
             currentParentToolCallId = null;
+            currentAgentName = null;
             lastStreamId = null;
             reasoningStartTime = null;
             reasoningDurationMs = null;

@@ -106,6 +106,42 @@ export function isSubAgentTool(name: string) {
   return subAgentToolNames.includes(name);
 }
 
+export function isGenericSubAgentDispatchTool(name?: string) {
+  return name === "agent_spawn" || name === "agent_send" || name === "agent_list";
+}
+
+function extractSubAgentNameFromArguments(argumentsText?: string) {
+  if (!argumentsText || !argumentsText.trim()) {
+    return undefined;
+  }
+  try {
+    const parsed = JSON.parse(argumentsText) as Record<string, unknown>;
+    const value =
+      parsed.agent_id ??
+      parsed.agentId ??
+      parsed.agent_name ??
+      parsed.agentName ??
+      parsed.label;
+    return typeof value === "string" && value.trim() ? value.trim() : undefined;
+  } catch {
+    const match = argumentsText.match(
+      /agent[_-]?(?:id|name)["']?\s*[:=]\s*["']?([\w.-]+)/
+    );
+    return match?.[1];
+  }
+}
+
+export function getSubAgentDisplayToolName(
+  name: string,
+  agentName?: string,
+  argumentsText?: string
+) {
+  if (!isGenericSubAgentDispatchTool(name)) {
+    return name;
+  }
+  return agentName || extractSubAgentNameFromArguments(argumentsText) || name;
+}
+
 export function getAgentTypeName(type: string): string {
   return agentTypeNames[type] || type;
 }

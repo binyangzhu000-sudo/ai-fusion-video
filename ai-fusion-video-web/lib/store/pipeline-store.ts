@@ -221,7 +221,11 @@ export function getRunningConversationIds(): Set<string> {
 function appendToToolChildren(
   timeline: TimelineItem[],
   parentToolCallId: string,
-  updater: (children: SubTimelineItem[]) => SubTimelineItem[]
+  updater: (children: SubTimelineItem[]) => SubTimelineItem[],
+  options?: {
+    placeholderName?: string;
+    agentName?: string;
+  }
 ): TimelineItem[] {
   const found = timeline.some(
     (item) => item.type === "tool" && item.id === parentToolCallId
@@ -232,9 +236,10 @@ function appendToToolChildren(
     const placeholder: TimelineItem = {
       type: "tool",
       id: parentToolCallId,
-      name: "unknown_sub_agent",
+      name: options?.placeholderName || "sub_agent",
       arguments: "",
       status: "calling",
+      agentName: options?.agentName,
       children: updater([]),
     };
     return [...timeline, placeholder];
@@ -244,6 +249,12 @@ function appendToToolChildren(
     if (item.type === "tool" && item.id === parentToolCallId) {
       return {
         ...item,
+        ...(options?.placeholderName && isPlaceholderToolName(item.name)
+          ? { name: options.placeholderName }
+          : {}),
+        ...(options?.agentName && !item.agentName
+          ? { agentName: options.agentName }
+          : {}),
         children: updater(item.children ?? []),
       };
     }
@@ -254,13 +265,64 @@ function appendToToolChildren(
 function updateToolStatus(
   timeline: TimelineItem[],
   toolCallId: string,
-  status: "calling" | "done" | "error"
+  status: "calling" | "done" | "error",
+  options?: {
+    name?: string;
+    result?: string;
+    agentName?: string;
+  }
 ): TimelineItem[] {
-  return timeline.map((item) =>
-    item.type === "tool" && item.id === toolCallId
-      ? { ...item, status }
-      : item
+  let found = false;
+  const updated = timeline.map((item) => {
+    if (item.type !== "tool" || item.id !== toolCallId) {
+      return item;
+    }
+    found = true;
+    return {
+      ...item,
+      status,
+      ...(options?.result !== undefined ? { result: options.result } : {}),
+      ...(options?.name && isPlaceholderToolName(item.name)
+        ? { name: options.name }
+        : {}),
+      ...(options?.agentName && !item.agentName
+        ? { agentName: options.agentName }
+        : {}),
+    };
+  });
+
+  if (found) {
+    return updated;
+  }
+
+  return [
+    ...updated,
+    {
+      type: "tool",
+      id: toolCallId,
+      name: options?.name || "sub_agent",
+      arguments: "",
+      status,
+      result: options?.result,
+      agentName: options?.agentName,
+      children: [],
+    },
+  ];
+}
+
+function isPlaceholderToolName(name?: string): boolean {
+  return (
+    !name ||
+    name === "unknown_sub_agent" ||
+    name === "sub_agent" ||
+    name === "agent_spawn" ||
+    name === "agent_send" ||
+    name === "agent_list"
   );
+}
+
+function subAgentParentName(event: AiChatStreamEvent): string {
+  return event.agentName || event.toolName || "sub_agent";
 }
 
 function appendReasoningToSubTimeline(
@@ -391,7 +453,11 @@ function createEventHandler(
                       appendReasoningToSubTimeline(
                         children,
                         event.reasoningContent!
-                      )
+                      ),
+                    {
+                      placeholderName: subAgentParentName(event),
+                      agentName: event.agentName,
+                    }
                   );
                 } else {
                   next.reasoningText += event.reasoningContent;
@@ -445,6 +511,10 @@ function createEventHandler(
                         ...updatedChildren,
                         { type: "content" as const, text: content },
                       ];
+                    },
+                    {
+                      placeholderName: subAgentParentName(event),
+                      agentName: event.agentName,
                     }
                   );
                 } else {
@@ -479,7 +549,18 @@ function createEventHandler(
                         const exists = children.some(
                           (c) => c.type === "tool" && c.id === tc.id
                         );
-                        if (exists) return children;
+                        if (exists) {
+                          return children.map((child) =>
+                            child.type === "tool" && child.id === tc.id
+                              ? {
+                                  ...child,
+                                  name: tc.name || child.name,
+                                  arguments: tc.arguments || child.arguments,
+                                  status: "calling",
+                                }
+                              : child
+                          );
+                        }
                         return [
                           ...children,
                           {
@@ -490,6 +571,10 @@ function createEventHandler(
                             status: "calling" as const,
                           },
                         ];
+                      },
+                      {
+                        placeholderName: subAgentParentName(event),
+                        agentName: event.agentName,
                       }
                     );
                   } else {
@@ -505,6 +590,18 @@ function createEventHandler(
                         status: "calling",
                         agentName: event.agentName,
                       });
+                    } else {
+                      next.timeline = next.timeline.map((item) =>
+                        item.type === "tool" && item.id === tc.id
+                          ? {
+                              ...item,
+                              name: tc.name || item.name,
+                              arguments: tc.arguments || item.arguments,
+                              status: "calling",
+                              agentName: item.agentName || event.agentName,
+                            }
+                          : item
+                      );
                     }
                   }
                 }
@@ -522,45 +619,51 @@ function createEventHandler(
                   next.timeline = appendToToolChildren(
                     next.timeline,
                     event.parentToolCallId!,
-                    (children) =>
-                      children.map((c) =>
-                        c.type === "tool" && c.id === event.toolCallId
-                          ? {
-                              ...c,
-                              status: toolStatus,
-                              result: event.toolResult,
-                            }
-                          : c
-                      )
+                    (children) => {
+                      let found = false;
+                      const updated = children.map((child) => {
+                        if (child.type !== "tool" || child.id !== event.toolCallId) {
+                          return child;
+                        }
+                        found = true;
+                        return {
+                          ...child,
+                          name: event.toolName || child.name,
+                          status: toolStatus,
+                          result: event.toolResult,
+                        };
+                      });
+                      if (found) {
+                        return updated;
+                      }
+                      return [
+                        ...updated,
+                        {
+                          type: "tool" as const,
+                          id: event.toolCallId!,
+                          name: event.toolName || "tool",
+                          arguments: "",
+                          status: toolStatus,
+                          result: event.toolResult,
+                        },
+                      ];
+                    },
+                    {
+                      placeholderName: subAgentParentName(event),
+                      agentName: event.agentName,
+                    }
                   );
                 } else {
-                  const exists = next.timeline.some(
-                    (item) =>
-                      item.type === "tool" && item.id === event.toolCallId
-                  );
-                  if (exists) {
-                    next.timeline = next.timeline.map((item) =>
-                      item.type === "tool" && item.id === event.toolCallId
-                        ? {
-                            ...item,
-                            status: toolStatus,
-                            result: event.toolResult,
-                            // 补充工具名（占位节点可能为 unknown_sub_agent）
-                            ...(event.toolName ? { name: event.toolName } : {}),
-                          }
-                        : item
-                    );
-                  } else if (event.toolName) {
-                    // 容错：TOOL_CALL 已被裁剪，补创建已完成工具节点
-                    next.timeline.push({
-                      type: "tool",
-                      id: event.toolCallId,
+                  next.timeline = updateToolStatus(
+                    next.timeline,
+                    event.toolCallId,
+                    toolStatus,
+                    {
                       name: event.toolName,
-                      arguments: "",
-                      status: toolStatus,
                       result: event.toolResult,
-                    });
-                  }
+                      agentName: event.agentName,
+                    }
+                  );
                 }
               }
               // 收集 invalidation
@@ -578,7 +681,11 @@ function createEventHandler(
                 next.timeline = updateToolStatus(
                   next.timeline,
                   event.parentToolCallId!,
-                  "done"
+                  "done",
+                  {
+                    name: subAgentParentName(event),
+                    agentName: event.agentName,
+                  }
                 );
               }
               break;
@@ -607,7 +714,11 @@ function createEventHandler(
                 next.timeline = updateToolStatus(
                   next.timeline,
                   event.parentToolCallId!,
-                  "error"
+                  "error",
+                  {
+                    name: subAgentParentName(event),
+                    agentName: event.agentName,
+                  }
                 );
                 next.timeline = appendToToolChildren(
                   next.timeline,
@@ -616,9 +727,13 @@ function createEventHandler(
                     ...children,
                     {
                       type: "content" as const,
-                        text: `${event.agentName || "子Agent"} 出错：${event.error || "未知错误"}`,
+                      text: `${event.agentName || "子Agent"} 出错：${event.error || "未知错误"}`,
                     },
-                  ]
+                  ],
+                  {
+                    placeholderName: subAgentParentName(event),
+                    agentName: event.agentName,
+                  }
                 );
               } else if (event.agentName) {
                 next.timeline.push({
